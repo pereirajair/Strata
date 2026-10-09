@@ -233,6 +233,15 @@ public:
     /// previous stage instead of embedding the tokens; a stage that does not end at the last layer copies its rows
     /// to pinned host buffers (two, allocated by `init`) and runs `next` on them - on a thread, so the next stage
     /// reads chunk c while this one reads chunk c + 1.  `on_chunk` belongs on the last stage.  Set before `init`.
+    /// LAYER SPLIT ACROSS PROCESSES (a stage per machine): this stage's earlier layers run in another process.
+    /// `run` asks `remote_prev` for each chunk's residual rows (host, T x hc*n_embd) instead of a local `next`
+    /// chain: (tokens, T, pos0, rows, err).  Needs `set_stage` with a first layer above 0.
+    std::function<bool(const int64_t*, int64_t, int64_t, float*, std::string&)> remote_prev;
+    /// The other side: this stage's last layer is not the model's, and its rows of each chunk (host, T x
+    /// hc*n_embd, valid during the call) go to the next stage in another process: (rows, T, pos0, err).
+    std::function<bool(const float*, int64_t, int64_t, std::string&)> remote_next;
+    /// Floats per token of a prompt hand-off row (the multi-stream residual).
+    static int64_t handoff_floats();
     void set_stage(int64_t layer_begin, int64_t layer_end, Prefill* next) {
         stage_lb_ = layer_begin; stage_le_ = layer_end; next_ = next;
     }
@@ -310,6 +319,9 @@ private:
     int hand_pieces_ = 0;
 
     std::string next_err_;
+    float* remote_rows_ = nullptr;      ///< pinned host rows for remote_prev / remote_next (one chunk)
+    int64_t remote_rows_cap_ = 0;
+    bool remote_rows(int64_t T, std::string& err);
     std::future<bool> next_run_;
     int hand_buf_ = 0;
 
