@@ -852,8 +852,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         return false;
     }
     const WeightRef* wo = wt.find("output.weight");
-    if (wo == nullptr) { err = "verify: output.weight is missing"; return false; }
-    n_vocab_ = wo->ne1;
+    if (wo == nullptr && le_ >= g.n_layers) { err = "verify: output.weight is missing"; return false; }
+    n_vocab_ = wo != nullptr ? wo->ne1 : 1;   // an earlier stage in its own process has no head
 
     const strata::kernels::QsaShapes s = shapes_of(g);
     cap_ = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);
@@ -3091,6 +3091,11 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     // or this thread would serve the window as the other variant
     const bool pre = prelaunched_ == T;
     prelaunched_ = 0;
+    if (prev_run_ && lb_ > 0) {   // a stage per process: the earlier stage's rows for this window first
+        if (hand_in_host_ == nullptr) { err = "verify: a remote earlier stage needs the hand-off's host side"; return false; }
+        if (!prev_run_(T, tokens, pos0, hand_in_host_, err)) return false;
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+    }
     if (!pre && pre_launch_ && !pre_launch_(cs_, err)) return false;   // (a prelaunched window's was served with the first stage's)
     if (!pre) refresh_ar();
     // STRATA_SELECT_LONG: the select kernels this window's context pays off with (the same on every stage)
@@ -3642,6 +3647,7 @@ bool Verifier::commit(int n_keep, std::string& err) {
 #endif
     const OnDevice on_device(device_);
     if (n_keep < 1 || n_keep > last_t_) { err = "verify: commit count out of range"; return false; }
+    if (prev_commit_ && lb_ > 0 && !prev_commit_(n_keep, err)) return false;
     const Clock::time_point t0 = Clock::now();
     h_commit_[0] = n_keep;
     h_commit_[1] = n_keep - 1;
