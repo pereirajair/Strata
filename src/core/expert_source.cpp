@@ -1129,6 +1129,7 @@ bool FileExpertSource::open_gguf(std::string& err) {
     role_bytes_.assign((size_t) (3 * n_layers_), 0);
     role_file_.assign((size_t) (3 * n_layers_), 0);
     for (int64_t l = 0; l < n_layers_; ++l) {
+        if (lay.bytes[(size_t) l] == 0) continue;   // a layer slice's pack: another stage's layer
         const auto& fm = lay.fmt[(size_t) l];
         const uint64_t per[3] = {fm.up_off, fm.up_off, lay.bytes[(size_t) l] - fm.down_off};
         for (int r = 0; r < 3; ++r) {
@@ -4235,7 +4236,7 @@ void ExpertSource::record_inputs(const std::string& pack_experts, const std::str
     if (!from_gguf) { inputs_.push_back({"pack experts.bin", pack_experts}); return; }
     // the same resolution open_gguf / load_experts_gguf use: every (layer, role) tensor and the file it is read from
     for (int64_t l = 0; l < lay.n_layers; ++l)
-        for (int r = 0; r < 3; ++r)
+        for (int r = 0; r < 3 && lay.bytes[(size_t) l] > 0; ++r)   // (a layer slice's pack: only its layers)
             inputs_.push_back({"expert blk." + std::to_string(l) + ".ffn_" + roles[r], expert_gguf_file(gguf, lay, l, r)});
 }
 
@@ -4248,6 +4249,7 @@ bool check_experts_gguf(const std::string& gguf, const strata::kernels::cpu::Exp
     try {
         std::map<std::string, std::unique_ptr<strata::GgufFile>> files;
         for (int64_t l = 0; l < lay.n_layers; ++l) {
+            if (lay.bytes[(size_t) l] == 0) continue;   // a layer slice's pack: another stage's layer
             const auto& fm = lay.fmt[(size_t) l];
             const uint64_t blob = lay.bytes[(size_t) l];
             const uint64_t per[3] = {fm.up_off, fm.up_off, blob - fm.down_off};
@@ -4340,6 +4342,7 @@ LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst, const strata:
             for (;;) {
                 const int64_t l = next.fetch_add(1);
                 if (l >= lay.n_layers || bad) break;
+                if (lay.bytes[(size_t) l] == 0) continue;   // a layer slice's pack: another stage's layer
                 wait_ready(l);
                 const auto& fm = lay.fmt[(size_t) l];
                 const uint64_t blob = lay.bytes[(size_t) l];
@@ -4419,6 +4422,7 @@ LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst, const strata:
         for (;;) {
             const int64_t l = next.fetch_add(1);
             if (l >= lay.n_layers || bad) break;
+            if (lay.bytes[(size_t) l] == 0) continue;   // a layer slice's pack: another stage's layer
             wait_ready(l);
             const auto& fm = lay.fmt[(size_t) l];
             const uint64_t blob = lay.bytes[(size_t) l];

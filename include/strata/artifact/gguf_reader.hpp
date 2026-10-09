@@ -29,6 +29,7 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <cstdlib>
 #include <set>
 #include <stdexcept>
 #include <algorithm>
@@ -383,7 +384,37 @@ public:
     }
     const uint8_t* tensor_data(const TensorInfo& t) const { return base_ + data_start_ + t.offset; }
 
+    /// A layer slice cut by POM (its `pom.start_layer` / `pom.end_layer` / `pom.original_block_count` keys): the
+    /// tensors are read under their layers' numbers in the whole model (`blk.i` of the file is `blk.(start + i)`),
+    /// and `<arch>.block_count` reads as the whole model's, so the rest of the engine sees layers start..end of
+    /// the model.  `slice_begin() == -1`: not a slice.
+    int64_t slice_begin() const { return slice_begin_; }
+    int64_t slice_end() const { return slice_end_; }   ///< the last layer the slice holds, inclusive
+
 private:
+    int64_t slice_begin_ = -1, slice_end_ = -1;
+    /// POM slices: see slice_begin().  Runs after the directory is read, before the duplicate check.
+    void renumber_slice() {
+        const MetaValue* b = get("pom.start_layer");
+        const MetaValue* e = get("pom.end_layer");
+        const MetaValue* n = get("pom.original_block_count");
+        if (!b || !e || !n || e->u < b->u || n->u <= e->u) return;
+        slice_begin_ = (int64_t) b->u;
+        slice_end_ = (int64_t) e->u;
+        for (auto& t : tensors_) {
+            if (t.name.rfind("blk.", 0) != 0) continue;
+            const size_t dot = t.name.find('.', 4);
+            if (dot == std::string::npos) continue;
+            char* end = nullptr;
+            const unsigned long long i = std::strtoull(t.name.c_str() + 4, &end, 10);
+            if (end != t.name.c_str() + dot) continue;
+            t.name = "blk." + std::to_string(i + b->u) + t.name.substr(dot);
+        }
+        if (const MetaValue* arch = get("general.architecture")) {
+            auto it = meta_.find(arch->s + ".block_count");
+            if (it != meta_.end()) it->second.u = n->u;
+        }
+    }
     void open() {
 #ifdef _WIN32
         HANDLE h = CreateFileA(path_.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
@@ -461,6 +492,7 @@ private:
             t.offset = c.read<uint64_t>();
             tensors_.push_back(std::move(t));
         }
+        renumber_slice();
         uint64_t align = 32;
         if (const MetaValue* a = get("general.alignment"))
             if (a->u) align = a->u;

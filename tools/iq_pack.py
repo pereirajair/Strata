@@ -436,12 +436,16 @@ def expert_layout(model: Model, src: pathlib.Path):
     exps = [n for n in T if n.startswith("blk.") and n.endswith("_exps.weight")]
     if not exps:
         return "the model has no expert tensors (blk.N.ffn_{gate,up,down}_exps.weight)"
-    n_layers = 1 + max(int(n.split(".")[1]) for n in exps)
-    n_expert = int(T["blk.0.ffn_gate_inp.weight"].shape[1])   # router rows = experts kept (pruned models ship < 512)
-    if any(int(T["blk.%d.ffn_gate_inp.weight" % l].shape[1]) != n_expert for l in range(n_layers)):
+    # the layers the file holds: all of them, or one layer slice (a POM slice: gguf_reader numbers its layers as
+    # the whole model's, so a slice of layers 27-47 packs layers 27-47)
+    layers = sorted({int(n.split(".")[1]) for n in exps})
+    if layers != list(range(layers[0], layers[-1] + 1)):
+        return "the expert layers are not contiguous: %s" % layers
+    n_expert = int(T["blk.%d.ffn_gate_inp.weight" % layers[0]].shape[1])   # router rows = experts kept (pruned models ship < 512)
+    if any(int(T["blk.%d.ffn_gate_inp.weight" % l].shape[1]) != n_expert for l in layers):
         return "the routers disagree on the expert count; a per-layer pruned model cannot be packed"
     layout, lines, offset, n_split = [], [], 0, 0
-    for l in range(n_layers):
+    for l in layers:
         names = ["blk.%d.ffn_%s_exps.weight" % (l, r) for r in ROLES]
         if any(n not in T for n in names):
             return "layer %d: missing %s" % (l, ", ".join(n for n in names if n not in T))
@@ -480,7 +484,7 @@ def expert_layout(model: Model, src: pathlib.Path):
                 "[shard | gate,up,down] (n_expert %d, total %d; absolute offsets in %s, or in the named shard "
                 "beside it - per role where the column is gate,up,down)\n" % (n_expert, offset, src.name))
         print("%d layer(s) have their gate/up/down in different shards: native_experts.txt v4, per-role shard "
-              "column for %s" % (n_split, ", ".join(str(l) for l, *_ in layout if "," in lines[l])))
+              "column for %s" % (n_split, ", ".join(str(row[0]) for row, line in zip(layout, lines) if "," in line)))
     else:
         head = ("# strata native experts v3: layer gu_type d_type offset blob_bytes gate_off up_off down_off [shard] "
                 "(n_expert %d, total %d; absolute offsets in %s, or in the named shard beside it)\n"

@@ -480,6 +480,12 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
     }
     uint64_t at = 0;
     for (int64_t l = 0; l < n_layers; ++l) {
+        // A pack of one layer slice (a POM slice, tools/iq_pack.py) lists only its layers: the others are absent
+        // (no blob, no bytes), and the stage that holds the slice never runs them.
+        if (L.offset[(size_t) l] == ~0ull && L.bytes[(size_t) l] == 0) {
+            L.offset[(size_t) l] = at;
+            continue;
+        }
         if (L.offset[(size_t) l] != at) {
             err = "native_experts.txt: layer " + std::to_string(l) + " is missing or not contiguous";
             return false;
