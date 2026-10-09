@@ -6929,8 +6929,19 @@ int main(int argc, char** argv) {
                         return stage_prev.window(T, t, p0, rows, e);
                     },
                     [&](int n, std::string& e) { return stage_prev.commit(n, e); }, stage_hand_in);
+                // a prompt chunk goes in pieces of STRATA_STAGE_PIECE tokens (1024 by default): one piece's rows
+                // (~40 KB a token) are one frame of the link, which a relay between the machines may carry whole
+                static const int64_t piece = [] {
+                    const char* v = std::getenv("STRATA_STAGE_PIECE");
+                    return v != nullptr && std::atoll(v) > 0 ? (int64_t) std::atoll(v) : (int64_t) 1024;
+                }();
                 sp.remote_prev = [&](const int64_t* t, int64_t n, int64_t p0, float* rows, std::string& e) {
-                    return stage_prev.prefill(t, n, p0, rows, e);
+                    for (int64_t a = 0; a < n; a += piece) {
+                        const int64_t m = std::min(piece, n - a);
+                        if (!stage_prev.prefill(t + a, m, p0 + a, rows + (size_t) a * stage_prev.prompt_floats(), e))
+                            return false;
+                    }
+                    return true;
                 };
             }
         }
