@@ -14,6 +14,7 @@
 // AND IT IS PHASE 2, so hit rate is `h = 0` and the number it prints is slow on purpose
 // (`phase-2-correct-engine.md:5-9`).  What it is FOR is the honest tok/s figure and the logit dump.
 
+#include "stage_link.hpp"
 #include "strata/platform/memory.hpp"
 #include "strata/core/arch_defaults.hpp"
 #include "strata/core/dma_batch.hpp"
@@ -581,6 +582,14 @@ struct Options {
     bool split_skip_if_fits = false;
     /// Plan v0.3 P8: stay resident and take requests on stdin (see the --serve block in main).
     bool serve = false;
+    // A STAGE PER PROCESS (one machine each): --native names a layer slice (a POM slice, read under its layers'
+    // numbers in the whole model), and this process runs only layers [stage_lo, stage_hi).  The first stage runs
+    // as --stage-serve HOST:PORT (it answers the next stage's process with its rows); a later stage serves the
+    // requests and asks the earlier stage for its rows over --stage-prev HOST:PORT (STRATA_STAGE_TOKEN).
+    int64_t stage_lo = 0, stage_hi = -1;
+    bool stage_serve = false;
+    std::string stage_listen;
+    std::string stage_prev;
     /// The vision path: keep a per-cell (t, h, w) rotary position table so --serve can take GENI requests.
     bool vision = false;
     int adapt_swaps = 96;
@@ -1811,6 +1820,8 @@ int main(int argc, char** argv) {
         else if (a == "--split-skip-if-fits") o.split_skip_if_fits = true;
         else if (a == "--pcie-mode") o.pcie_mode = next("--pcie-mode");
         else if (a == "--serve") o.serve = true;
+        else if (a == "--stage-serve") { o.stage_listen = next("--stage-serve"); o.stage_serve = true; }
+        else if (a == "--stage-prev") o.stage_prev = next("--stage-prev");
         else if (a == "--vision") o.vision = true;
         else if (a == "--prompt-cache") o.prompt_cache = std::max(0, std::atoi(next("--prompt-cache")));
         else if (a == "--conversation-cache-mib" || a == "--conversation-cache-slots" ||
@@ -2204,6 +2215,13 @@ int main(int argc, char** argv) {
             // every shard of the model (<name>-0000N-of-0000M.gguf beside --native).  A missing shard is an error
             // here: it used to be skipped, leaving a model with some tensors absent and a later error, or none.
             o.native_shards = strata::gguf_split_paths(o.native_preset);
+            {   // a layer slice: this process is one stage of the model
+                const strata::GgufFile first(o.native_shards[0]);
+                if (first.slice_begin() >= 0) {
+                    o.stage_lo = first.slice_begin();
+                    o.stage_hi = first.slice_end() + 1;
+                }
+            }
             // --ple-gguf defaults to the shard that holds the PLE table, found by name: shard 2 of the ISTA files
             // and of Unsloth's UD-Q4_K_XL, shard 1 of Swift's
             if (o.ple_gguf.empty() && !o.no_ple) {
@@ -2215,7 +2233,10 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: --native %s: %s\n", o.native_preset.c_str(), e.what());
             return 2;
         }
-        if (o.no_ple || o.ple_gguf.empty()) {
+        if (o.stage_lo > 1 && o.ple_gguf.empty()) {
+            // a stage past layer 1 never runs the PLE block (it is a layer-1 module): no table to read
+            o.no_ple = true;
+        } else if (o.no_ple || o.ple_gguf.empty()) {
             std::fprintf(stderr, "strata generate: --native requires --ple-gguf (the PLE key is native too), and no "
                                  "shard of the model holds per_layer_token_embd.weight\n");
             return 2;
@@ -2225,7 +2246,9 @@ int main(int argc, char** argv) {
         o.native_bf16 = o.native_bf16_extra = true;
         o.native_ple_key = o.native_moe_combine = o.native_gdn = o.native_router = true;
         o.native_qsa = o.native_qsa_indexer = o.native_rope = o.native_ple_postops = true;
-        if (o.native_head_gguf.empty()) o.native_head_gguf = o.native_preset;
+        if (o.no_ple) o.native_ple_postops = o.native_ple_key = false;   // a stage past layer 1
+        // the head is on the last stage only: an earlier stage hands its rows on instead
+        if (o.native_head_gguf.empty() && (o.stage_hi < 0 || o.stage_hi == 48)) o.native_head_gguf = o.native_preset;
         if (o.native_dense_gguf.empty()) {
             // every shard of the model (<name>-0000N-of-0000M.gguf beside --native), then the PLE shard: a split
             // may put any layer in any shard (Swift's GGUFs: layers 13-47 in shard 2, the PLE table in shard 1)
@@ -2236,7 +2259,7 @@ int main(int argc, char** argv) {
                 strata::GgufFile pg(o.ple_gguf);
                 if (const strata::MetaValue* v = pg.get("general.architecture")) ple_only = v->s == "strata-ple";
             } catch (const std::exception&) {}
-            if (!ple_only &&
+            if (!ple_only && !o.ple_gguf.empty() &&
                 std::find(o.native_dense_gguf.begin(), o.native_dense_gguf.end(), o.ple_gguf) == o.native_dense_gguf.end())
                 o.native_dense_gguf.push_back(o.ple_gguf);
         }
@@ -2258,6 +2281,43 @@ int main(int argc, char** argv) {
     if (!o.no_ple && o.ple_gguf.empty()) {
         std::fprintf(stderr, "strata generate: --ple-gguf is required; --no-ple explicitly enables a diagnostic ablation\n");
         return 2;
+    }
+    // A STAGE PER PROCESS (see Options::stage_lo and src/program/stage_link.hpp)
+    const bool stage_mode = o.stage_hi > 0;
+#if !defined(_WIN32)
+    strata::stage::PrevStage stage_prev;   // a later stage's link to the earlier stage's process
+#endif
+    const int64_t kStageLayers = 48;   // the qwen4exp geometry (Qwen4ExpGuard)
+    if (stage_mode || o.stage_serve || !o.stage_prev.empty()) {
+        const char* why = !stage_mode ? "--stage-serve and --stage-prev need --native with a layer slice"
+                        : !o.layer_split.empty() ? "a stage per process runs on one GPU: no --layer-split"
+                        : o.stage_serve && o.stage_lo != 0 ? "--stage-serve is the first stage (layer 0)"
+                        : o.stage_serve && o.stage_hi >= kStageLayers ? "the last stage serves the requests (--serve)"
+                        : !o.stage_serve && o.stage_lo > 0 && o.stage_prev.empty() ? "a stage after layer 0 needs --stage-prev"
+                        : !o.stage_serve && o.stage_hi < kStageLayers ? "a stage before the last layer runs as --stage-serve"
+                        : nullptr;
+        if (why != nullptr) {
+            std::fprintf(stderr, "strata generate: %s\n", why);
+            return 2;
+        }
+#if defined(_WIN32)
+        std::fprintf(stderr, "strata generate: a stage per process is not available on Windows yet\n");
+        return 2;
+#endif
+        // every request starts the stages from position 0: the conversation cache, the prompt cache, batch slots and
+        // pipelined windows keep state the other stage's process does not share (yet)
+        o.prompt_cache = 0;
+        o.conversation_cache_mib = 0;
+        o.batch = 0;
+        o.pipeline_windows = 0;
+        if (o.stage_serve) {
+            o.serve = true;
+            o.mtp.clear();                                           // the drafter is on the last stage
+            o.no_prefill_borrow = true;   // its prompt path keeps its own buffers: no loans to give back between reads
+            o.spec = std::max(o.spec, strata::kernels::kVerifyMaxT);  // any window the last stage sends
+        }
+        std::fprintf(stderr, "strata generate: stage of layers %lld-%lld (%s)\n", (long long) o.stage_lo,
+                     (long long) o.stage_hi - 1, o.stage_serve ? "serving the next stage" : "after a remote stage");
     }
     // P7 audit: positions, cells and pooled-block indices are cast to int32 on the device path.
     if (o.max_context > 2147483647LL - 8) {
@@ -2423,6 +2483,7 @@ int main(int argc, char** argv) {
         // an unsupported dequant type left the prompt path's fp16 buffer unwritten.
         const auto& lay = strata::kernels::cpu::expert_layout();
         for (int64_t l = 0; lay.native && l < (int64_t) lay.fmt.size(); ++l) {
+            if (stage_mode && (l < o.stage_lo || l >= o.stage_hi)) continue;   // another stage's layer
             const auto& f = lay.fmt[(size_t) l];
             if (!strata::kernels::native_expert_supported(f.gu_type, f.d_type, f.n_embd, f.n_ff)) {
                 std::fprintf(stderr, "strata generate: layer %lld's experts are %s/%s (ggml types %d/%d), which this "
@@ -2667,6 +2728,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: layer split: CUDA0 loads the dense weights of layers 0-%lld only\n",
                      (long long) split_at[0] - 1);
     }
+    if (stage_mode) strata::core::NativeDense::set_layer_range((int) o.stage_lo, (int) o.stage_hi);
     uint64_t pool_bytes = 0;
     if (!strata::core::WeightTable::pool_bytes(o.pack, pool_bytes, err, skip.empty() ? nullptr : &skip)) {
         std::fprintf(stderr, "strata generate: %s\n", err.c_str());
@@ -3168,6 +3230,13 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata generate: STRATA_PEER_HOT %.2f: %zu of the first %zu ranked pairs moved "
                                      "behind rank %zu (the peer's)\n", f, n_moved, at, fill);
             }
+        }
+        if (stage_mode) {   // a stage per process caches only its own layers' experts
+            profile.erase(std::remove_if(profile.begin(), profile.end(),
+                                         [&](const std::pair<int32_t, int32_t>& pr) {
+                                             return pr.first < o.stage_lo || pr.first >= o.stage_hi;
+                                         }),
+                          profile.end());
         }
         std::fprintf(stderr, "strata generate: profile %s: %zu ranked pairs, built for %lld slots\n",
                      o.expert_profile.c_str(), profile.size(), (long long) pslots);
@@ -3784,7 +3853,8 @@ int main(int argc, char** argv) {
     // fixed in llama.cpp: allocation sized by the whole model instead of the device's own work.
     {
         const strata::core::OnDevice on0(0);
-        const int64_t hi0 = multi_gpu ? split_at[0] : -1;
+        const int64_t hi0 = multi_gpu ? split_at[0] : stage_mode && o.stage_hi < kStageLayers ? o.stage_hi : -1;
+        const int64_t lo0 = stage_mode ? o.stage_lo : 0;
         // the elastic K/V (--kv-grow, see kvg_ensure): one GPU, the whole K/V in VRAM (no streaming), a profiled cache
         // that can give slots up, and every expert in RAM for the CPU to compute the ones it gives up
         {
@@ -3804,11 +3874,11 @@ int main(int argc, char** argv) {
             strata::core::qsa_set_kv_elastic(on, iv != nullptr && std::atoll(iv) > 0 ? std::atoll(iv) : 16384);
             strata::core::ExpertCache::set_vmm(on);
         }
-        if (cudaMalloc(&sbuf, strata::core::session_bytes(g, o.max_context, K, 0, hi0)) != cudaSuccess) {
+        if (cudaMalloc(&sbuf, strata::core::session_bytes(g, o.max_context, K, lo0, hi0)) != cudaSuccess) {
             std::fprintf(stderr, "strata generate: session state allocation failed\n");
             return 1;
         }
-        if (strata::core::session_init(g, o.max_context, K, sbuf, ss, 0, hi0) == 0) {
+        if (strata::core::session_init(g, o.max_context, K, sbuf, ss, lo0, hi0) == 0) {
             std::fprintf(stderr, "strata generate: session_init failed\n");
             return 1;
         }
@@ -4009,8 +4079,16 @@ int main(int argc, char** argv) {
     // arena registers tens of GiB of host pages, like the drafter above - WDDM then refused the head's cudaMalloc on
     // a 16 GB card with the desktop on the iGPU ("native head upload: out of memory" with GiBs free).
     const strata::core::WeightRef* wo = wt.find("output.weight");
-    if (wo == nullptr) { std::fprintf(stderr, "strata generate: output.weight is missing\n"); return 1; }
-    const int64_t n_vocab = wo->ne1;
+    int64_t n_vocab = wo != nullptr ? wo->ne1 : 0;
+    if (wo == nullptr && stage_mode && o.stage_hi < kStageLayers) {
+        // an earlier stage has no head (its slice holds no output.weight): the vocabulary is the embedding's
+        try {
+            const strata::GgufModel model(o.native_shards);
+            if (const strata::TensorInfo* te = model.find("token_embd.weight"); te != nullptr && te->shape.size() == 2)
+                n_vocab = (int64_t) te->shape[1];
+        } catch (const std::exception&) {}
+    }
+    if (n_vocab <= 0) { std::fprintf(stderr, "strata generate: output.weight is missing\n"); return 1; }
     strata::core::NativeHead native_head;
     if (!o.native_head_gguf.empty() && !multi_gpu) {   // a layer split's head is on its last stage
         const auto head_t0 = std::chrono::steady_clock::now();
@@ -6504,6 +6582,7 @@ int main(int argc, char** argv) {
                 }
             }
             if (multi_gpu) sp.set_stage(0, split_at[0], &stages[0]->sp);
+            else if (stage_mode) sp.set_stage(o.stage_lo, o.stage_hi < kStageLayers ? o.stage_hi : -1, nullptr);
             if (share_pool) sp.set_cpu_pool(&pool);
             if (!sp.init(wt, g, ss, srcp, &xcache, host_res.data(), o.prefill_chunk, main_cs, err, borrow, borrow_bytes))
                 return err.find("do not fit") != std::string::npos ? 2 : 1;
@@ -6798,6 +6877,64 @@ int main(int argc, char** argv) {
             }
             ver_b.set_next(&gs.ver_b, &split_drive_b);   // the setters reach it; the pipeline never chains run/commit
         }
+#if !defined(_WIN32)
+        // A STAGE PER PROCESS: the verify window's hand-offs live in mapped pinned memory, as between the GPUs of a
+        // --layer-split; an earlier stage's process fills `stage_hand_in` before each window (Verifier::
+        // set_remote_prev), and a stage server reads `stage_hand_out` after it
+        float* stage_hand_in = nullptr;
+        float* stage_hand_out = nullptr;
+        if (stage_mode) {
+            const size_t hb = (size_t) strata::kernels::kVerifyMaxT *
+                              (size_t) strata::core::Verifier::handoff_floats(g) * sizeof(float);
+            auto mapped = [&](float*& host) -> float* {
+                float* dev = nullptr;
+                if (cudaHostAlloc((void**) &host, hb, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
+                    cudaHostGetDevicePointer((void**) &dev, host, 0) != cudaSuccess)
+                    return nullptr;
+                std::memset(host, 0, hb);
+                return dev;
+            };
+            float* in_dev = o.stage_lo > 0 ? mapped(stage_hand_in) : nullptr;
+            float* out_dev = o.stage_hi < kStageLayers ? mapped(stage_hand_out) : nullptr;
+            if ((o.stage_lo > 0 && in_dev == nullptr) || (o.stage_hi < kStageLayers && out_dev == nullptr)) {
+                std::fprintf(stderr, "strata serve: the stage hand-off allocation failed\n");
+                return 1;
+            }
+            ver.set_stage(o.stage_lo, o.stage_hi < kStageLayers ? o.stage_hi : -1, in_dev, out_dev);
+            if (out_dev != nullptr) ver.set_handoff_out_host(stage_hand_out);
+            if (o.stage_lo > 0) {
+                // the earlier stage loads its slice too: wait for it (STRATA_STAGE_WAIT_S, 900 s by default)
+                const char* tok = std::getenv("STRATA_STAGE_TOKEN");
+                const char* ws = std::getenv("STRATA_STAGE_WAIT_S");
+                const auto until = Clock::now() + std::chrono::seconds(ws != nullptr ? std::atoi(ws) : 900);
+                std::string cerr;
+                bool linked = false;
+                while (!(linked = stage_prev.connect(o.stage_prev, tok != nullptr ? tok : "", o.stage_lo, cerr)) &&
+                       Clock::now() < until && cerr.find("runs layers") == std::string::npos &&
+                       cerr.find("hello") == std::string::npos) {
+                    std::this_thread::sleep_for(std::chrono::seconds(2));
+                }
+                if (!linked) {
+                    std::fprintf(stderr, "strata serve: the earlier stage (%s): %s\n", o.stage_prev.c_str(), cerr.c_str());
+                    return 1;
+                }
+                if (stage_prev.window_floats() != (uint32_t) strata::core::Verifier::handoff_floats(g) ||
+                    stage_prev.prompt_floats() != (uint32_t) strata::prefill::Prefill::handoff_floats()) {
+                    std::fprintf(stderr, "strata serve: the earlier stage hands off rows of another size\n");
+                    return 1;
+                }
+                std::fprintf(stderr, "strata serve: linked to the earlier stage at %s\n", o.stage_prev.c_str());
+                ver.set_remote_prev(
+                    [&](int T, const int32_t* t, int64_t p0, float* rows, std::string& e) {
+                        return stage_prev.window(T, t, p0, rows, e);
+                    },
+                    [&](int n, std::string& e) { return stage_prev.commit(n, e); }, stage_hand_in);
+                sp.remote_prev = [&](const int64_t* t, int64_t n, int64_t p0, float* rows, std::string& e) {
+                    return stage_prev.prefill(t, n, p0, rows, e);
+                };
+            }
+        }
+#endif
         ver.set_remote_expert_opt(remote_opt.get());
         if (batch_mtp) ver.set_batch_graph_limit(64);   // --batch-mtp only: slot rotation makes many layouts (LRU); 0.1.39 keeps all
         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr,
@@ -8632,6 +8769,129 @@ int main(int argc, char** argv) {
                 if (!pump(false)) return false;
             return true;
         };
+#if !defined(_WIN32)
+        // A STAGE SERVER (--stage-serve HOST:PORT): this process runs the model's first layers for the next stage's
+        // process and answers it, one request at a time, with the rows its last layer hands on (stage_link.hpp).
+        // Nothing is read from stdin: the next stage drives every request.
+        if (o.stage_serve) {
+            namespace sl = strata::stage;
+            const char* tok_env = std::getenv("STRATA_STAGE_TOKEN");
+            const std::string token = tok_env != nullptr ? tok_env : "";
+            std::string lerr;
+            int bound = 0;
+            const int lfd = sl::tcp_open(o.stage_listen, true, lerr, &bound);
+            if (lfd < 0) {
+                std::fprintf(stderr, "strata serve: %s\n", lerr.c_str());
+                return 1;
+            }
+            const uint32_t wf = (uint32_t) strata::core::Verifier::handoff_floats(g);
+            const uint32_t pf = (uint32_t) strata::prefill::Prefill::handoff_floats();
+            std::fprintf(stderr, "strata serve: stage of layers %lld-%lld listening on %s (port %d)\n",
+                         (long long) o.stage_lo, (long long) o.stage_hi - 1, o.stage_listen.c_str(), bound);
+            std::printf("READY stage\n");
+            std::fflush(stdout);
+            std::vector<char> req, ans, rows;
+            std::vector<int32_t> picks((size_t) strata::kernels::kVerifyMaxT);
+            auto fail = [&](const std::string& m) {
+                ans.assign(1, (char) 1);
+                sl::put_bytes(ans, m.data(), m.size());
+            };
+            auto room = [&](int64_t cells) {
+                return !kvg.on || kvg_ensure(cells + 64, [&] { cudaDeviceSynchronize(); apply_pending(true); });
+            };
+            for (;;) {
+                const int cfd = ::accept(lfd, nullptr, nullptr);
+                if (cfd < 0) {
+                    if (errno == EINTR) continue;
+                    std::fprintf(stderr, "strata serve: accept: %s\n", std::strerror(errno));
+                    return 1;
+                }
+                const int one = 1;
+                ::setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+                bool hello = false, quit = false;
+                while (sl::recv_frame(cfd, req)) {
+                    std::string e;
+                    size_t at = 1;
+                    const char op = req.empty() ? 0 : req[0];
+                    ans.assign(1, (char) 0);
+                    if (!hello && op != 'H') {
+                        fail("say hello first");
+                    } else if (op == 'H') {
+                        if (std::string(req.data() + 1, req.size() - 1) != token) {
+                            fail("the stage token does not match");
+                            sl::send_frame(cfd, ans);
+                            break;
+                        }
+                        hello = true;
+                        sl::put<uint32_t>(ans, (uint32_t) o.stage_lo);
+                        sl::put<uint32_t>(ans, (uint32_t) o.stage_hi);
+                        sl::put<uint32_t>(ans, wf);
+                        sl::put<uint32_t>(ans, pf);
+                    } else if (op == 'Z') {
+                        strata::core::session_zero(ss, g, nullptr, main_cs);
+                        cudaStreamSynchronize(main_stream);
+                    } else if (op == 'P') {
+                        int64_t pos0 = 0;
+                        uint32_t n = 0;
+                        if (!sl::get(req, at, pos0) || !sl::get(req, at, n) || req.size() != at + (size_t) n * 8 || n == 0) {
+                            fail("a malformed prompt chunk");
+                        } else if (!room(pos0 + n)) {
+                            fail("the K/V cannot grow to " + std::to_string(pos0 + n) + " cells");
+                        } else {
+                            std::vector<int64_t> toks(n);
+                            std::memcpy(toks.data(), req.data() + at, (size_t) n * 8);
+                            ans.reserve(1 + (size_t) n * pf * sizeof(float));
+                            int64_t got = 0;
+                            sp.remote_next = [&](const float* r, int64_t T, int64_t, std::string&) {
+                                sl::put_bytes(ans, r, (size_t) T * pf * sizeof(float));
+                                got += T;
+                                return true;
+                            };
+                            const bool ok = sp.run(toks.data(), n, pos0, e);
+                            sp.remote_next = nullptr;
+                            if (!ok || got != (int64_t) n) fail(ok ? "the prompt chunk handed off " + std::to_string(got) +
+                                                                         " rows" : e);
+                        }
+                    } else if (op == 'W') {
+                        int64_t pos0 = 0;
+                        uint32_t T = 0;
+                        if (!sl::get(req, at, pos0) || !sl::get(req, at, T) || req.size() != at + (size_t) T * 4 || T == 0 ||
+                            T > (uint32_t) strata::kernels::kVerifyMaxT) {
+                            fail("a malformed verify window");
+                        } else if (!room(pos0 + T)) {
+                            fail("the K/V cannot grow to " + std::to_string(pos0 + T) + " cells");
+                        } else {
+                            std::vector<int32_t> toks(T);
+                            std::memcpy(toks.data(), req.data() + at, (size_t) T * 4);
+                            drive.d.layers = 0;
+                            drive.d.experts = 0;
+                            drive.d.failed = false;
+                            if (!ver.run((int) T, toks.data(), pos0, win_pool_fn, win_pool_user, picks.data(), e) ||
+                                drive.d.failed) {
+                                fail(drive.d.failed && drive.d.fail ? std::string(drive.d.fail) : e);
+                            } else {
+                                sl::put_bytes(ans, stage_hand_out, (size_t) T * wf * sizeof(float));
+                            }
+                        }
+                    } else if (op == 'C') {
+                        uint32_t n = 0;
+                        if (!sl::get(req, at, n) || !ver.commit((int) n, e) || !ver.wait_commit(e))
+                            fail(e.empty() ? "a malformed commit" : e);
+                    } else if (op == 'Q') {
+                        quit = true;
+                    } else {
+                        fail(std::string("unknown request ") + op);
+                    }
+                    if (!sl::send_frame(cfd, ans) || quit) break;
+                }
+                ::close(cfd);
+                if (quit) break;
+                std::fprintf(stderr, "strata serve: the next stage disconnected; waiting for it again\n");
+            }
+            ::close(lfd);
+            return 0;
+        }
+#endif
         for (;;) {
             if (batch_on() || (piped && pipe_inflight())) {
                 if (!try_next_line(line)) {
@@ -9330,6 +9590,14 @@ int main(int argc, char** argv) {
                     cudaStreamSynchronize(st->stream);
                 }
                 checks.clear();
+#if !defined(_WIN32)
+                if (stage_mode && o.stage_lo > 0 && !stage_prev.reset(err)) {   // the earlier stage starts over too
+                    std::printf("ERR the earlier stage: %s\n", err.c_str());
+                    std::fflush(stdout);
+                    live_ok = false;
+                    continue;
+                }
+#endif
             } else if (!from_live) {
                 ConvCheckpoint* c = nullptr;
                 for (ConvCheckpoint& k : checks) if ((int64_t) k.ids.size() == resume) c = &k;

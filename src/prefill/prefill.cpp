@@ -841,7 +841,10 @@ strata::kernels::QsaAttnPools pools_of(const strata::kernels::KvHostPools& h, co
 }  // namespace
 
 Prefill::Prefill() : impl_(new Impl) {}
-Prefill::~Prefill() { release(); }
+Prefill::~Prefill() {
+    release();
+    if (remote_rows_ != nullptr) cudaFreeHost(remote_rows_);
+}
 
 void Prefill::reset() {
     release();
@@ -998,7 +1001,8 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     }
     cudaGetDevice(&m.device);
     if (stage_le_ < 0) stage_le_ = g.n_layers;
-    if (stage_lb_ < 0 || stage_lb_ >= stage_le_ || stage_le_ > g.n_layers || (stage_le_ < g.n_layers) != (next_ != nullptr)) {
+    if (stage_lb_ < 0 || stage_lb_ >= stage_le_ || stage_le_ > g.n_layers || (stage_le_ >= g.n_layers && next_ != nullptr)) {
+        // (an earlier stage without `next` hands its rows to another process: remote_next, checked by run)
         err = "prefill: the stage's layer range is wrong";
         return false;
     }
@@ -3892,6 +3896,18 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         stats_.tokens += T;
         core::progress_at("reading the prompt (batched): finishing the chunk from token", p0);
         pt.mark(kPfStart, cs);
+        if (next_ == nullptr && remote_next) {
+            // a stage per process: this chunk's rows go to the next stage's process, which reads them before
+            // this stage reads the next chunk (the call returns once they are sent)
+            if (!remote_rows(T, err)) return false;
+            if (cudaMemcpyAsync(remote_rows_, m.R, (size_t) T * D * 4, cudaMemcpyDeviceToHost, m.cs) != cudaSuccess ||
+                cudaStreamSynchronize(m.cs) != cudaSuccess) {
+                err = std::string("prefill: the remote hand-off: ") + cudaGetErrorString(cudaGetLastError());
+                return false;
+            }
+            if (!remote_next(remote_rows_, T, p0, err)) return false;
+            continue;
+        }
         if (next_ != nullptr) {
             // The current hand-off slot was used two chunks ago.
             float* h = m.hand[hand_buf_];
@@ -4071,7 +4087,41 @@ bool Prefill::drain_pipeline(std::string& err) {
     return ok;
 }
 
+int64_t Prefill::handoff_floats() { return D; }
+
+bool Prefill::remote_rows(int64_t T, std::string& err) {
+    if (T <= remote_rows_cap_) return true;
+    if (remote_rows_ != nullptr) cudaFreeHost(remote_rows_);
+    remote_rows_ = nullptr;
+    remote_rows_cap_ = 0;
+    if (cudaHostAlloc((void**) &remote_rows_, (size_t) T * D * sizeof(float), cudaHostAllocDefault) != cudaSuccess) {
+        (void) cudaGetLastError();
+        err = "prefill: the remote hand-off buffer allocation failed";
+        return false;
+    }
+    remote_rows_cap_ = T;
+    return true;
+}
+
 bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err) {
+    if (impl_->g != nullptr && stage_le_ >= 0 && stage_le_ < impl_->g->n_layers && next_ == nullptr && !remote_next) {
+        err = "prefill: an earlier stage needs the next stage (set_stage) or remote_next";
+        return false;
+    }
+    if (remote_prev && stage_lb_ > 0) {
+        // a stage per process: the earlier stage reads each chunk in its process and hands its rows here
+        const int64_t step = std::max<int64_t>(1, chunk());
+        for (int64_t c0 = 0; c0 < n; c0 += step) {
+            const int64_t T = std::min(step, n - c0);
+            if (!remote_rows(T, err) || !remote_prev(tokens + c0, T, pos0 + c0, remote_rows_, err)) return false;
+            hand_in_ = remote_rows_;
+            single_chunk_ = n <= step;
+            const bool ok = run_impl(tokens + c0, T, pos0 + c0, err);
+            hand_in_ = nullptr;
+            if (!ok) return false;
+        }
+        return true;
+    }
     const bool body_ok = run_impl(tokens, n, pos0, err);
 
     std::string drain_err;

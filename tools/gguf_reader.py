@@ -102,11 +102,32 @@ class GGUFFile:
             type_id, offset = struct.unpack("<IQ", fh.read(12))
             self.tensors.append(TensorInfo(name, shape, type_id,
                                            GGML_TYPES.get(type_id, f"type{type_id}"), offset))
+        self.slice_range = self._renumber_slice()
         align = self.metadata.get("general.alignment")
         if isinstance(align, int) and align:
             self.alignment = align
         pos = fh.tell()
         self._data_start = (pos + self.alignment - 1) // self.alignment * self.alignment
+
+    def _renumber_slice(self):
+        """A layer slice cut by POM (`pom.start_layer` / `pom.end_layer` / `pom.original_block_count`): its tensors
+        read under their layers' numbers in the whole model (`blk.i` of the file is `blk.(start + i)`) and
+        `<arch>.block_count` reads as the whole model's.  Returns (start, end) inclusive, or None for a whole file
+        (the engine's GgufFile::slice_begin does the same)."""
+        b, e = self.metadata.get("pom.start_layer"), self.metadata.get("pom.end_layer")
+        n = self.metadata.get("pom.original_block_count")
+        if not all(isinstance(v, int) for v in (b, e, n)) or e < b or n <= e:
+            return None
+        for t in self.tensors:
+            if not t.name.startswith("blk."):
+                continue
+            head, _, rest = t.name[4:].partition(".")
+            if head.isdigit() and rest:
+                t.name = f"blk.{int(head) + b}.{rest}"
+        arch = self.metadata.get("general.architecture")
+        if isinstance(arch, str) and f"{arch}.block_count" in self.metadata:
+            self.metadata[f"{arch}.block_count"] = n
+        return (b, e)
 
     def _str(self, fh) -> str:
         (n,) = struct.unpack("<Q", fh.read(8))

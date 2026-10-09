@@ -32,6 +32,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <functional>
 #include <map>
 #include <cstdint>
 #include <string>
@@ -132,6 +133,20 @@ public:
     void set_stage(int64_t layer_begin, int64_t layer_end, const float* handoff_in, float* handoff_out) {
         lb_ = layer_begin; le_ = layer_end; hand_in_ = handoff_in; hand_out_ = handoff_out;
     }
+    /// LAYER SPLIT ACROSS PROCESSES (a stage per machine): this stage's earlier layers run in another process.
+    /// Before each window `run` asks `prev_run` for the window's hand-off rows - (T, tokens, pos0, rows, err), T x
+    /// handoff_floats() floats written to `rows`, the host side of `handoff_in` - and `commit` passes its count to
+    /// `prev_commit`.  Set with set_stage(layer_begin > 0, ...).  Batch windows and pipelined windows do not apply.
+    void set_remote_prev(std::function<bool(int, const int32_t*, int64_t, float*, std::string&)> prev_run,
+                         std::function<bool(int, std::string&)> prev_commit, float* handoff_in_host) {
+        prev_run_ = std::move(prev_run);
+        prev_commit_ = std::move(prev_commit);
+        hand_in_host_ = handoff_in_host;
+    }
+    /// The host side of the hand-off this stage writes (set_stage's `handoff_out`), for a later stage in another
+    /// process: valid after `run` returns, T x handoff_floats() floats.
+    void set_handoff_out_host(const float* host) { hand_out_host_ = host; }
+    const float* handoff_out_host() const { return hand_out_host_; }
     /// The next stage: `run` and `commit` continue into it (its pool calls get `next_user`); sampling settings
     /// and `final_R` are the last stage's.
     void set_next(Verifier* next, void* next_user) { next_ = next; next_user_ = next_user; }
@@ -360,6 +375,10 @@ private:
     int64_t lb_ = 0, le_ = -1;           ///< set_stage: the layers this verifier runs (-1: to the last)
     const float* hand_in_ = nullptr;
     float* hand_out_ = nullptr;
+    std::function<bool(int, const int32_t*, int64_t, float*, std::string&)> prev_run_;
+    std::function<bool(int, std::string&)> prev_commit_;
+    float* hand_in_host_ = nullptr;
+    const float* hand_out_host_ = nullptr;
     Verifier* next_ = nullptr;
     void* next_user_ = nullptr;
     bool ple_stage() const { return lb_ <= 1 && 1 < le_; }   ///< holds layer 1, where the PLE block runs
