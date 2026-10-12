@@ -3884,9 +3884,10 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: a stage per process is not available on Windows yet\n");
         return 2;
 #endif
-        // every request starts the stages from position 0: the conversation cache, the prompt cache, batch slots and
-        // pipelined windows keep state the other stage's process does not share (yet)
-        o.prompt_cache = 0;
+        // the prompt cache works across the stages: the earlier stage keeps its own checkpoints where the later one
+        // keeps them and continues from the same tokens ('R', 'S' in stage_link.hpp).  The conversation cache, batch
+        // slots, pipelined windows and the tail checkpoint keep state the other stage's process does not share (yet)
+        o.prompt_cache_tail = false;
         o.conversation_cache_mib = 0;
         o.batch = 0;
         o.pipeline_windows = 0;
@@ -10170,6 +10171,8 @@ int main(int argc, char** argv) {
         // set_remote_prev), and a stage server reads `stage_hand_out` after it
         float* stage_hand_in = nullptr;
         float* stage_hand_out = nullptr;
+        int64_t stage_piece = 0;   // a later stage: the prompt piece (tokens) and how many go ahead (the micro-pipeline)
+        int stage_depth = 1;
         if (stage_mode) {
             const size_t hb = (size_t) strata::kernels::kVerifyMaxT *
                               (size_t) strata::core::Verifier::handoff_floats(g) * sizeof(float);
@@ -10222,13 +10225,28 @@ int main(int argc, char** argv) {
                     const char* v = std::getenv("STRATA_STAGE_PIECE");
                     return v != nullptr && std::atoll(v) > 0 ? (int64_t) std::atoll(v) : (int64_t) 1024;
                 }();
-                sp.remote_prev = [&](const int64_t* t, int64_t n, int64_t p0, float* rows, std::string& e) {
-                    for (int64_t a = 0; a < n; a += piece) {
-                        const int64_t m = std::min(piece, n - a);
-                        if (!stage_prev.prefill(t + a, m, p0 + a, rows + (size_t) a * stage_prev.prompt_floats(), e))
-                            return false;
-                    }
-                    return true;
+                // THE MICRO-PIPELINE: a run's pieces are asked for ahead (remote_prev_begin, set with the prompt cache's
+                // checkpoints below), up to STRATA_STAGE_INFLIGHT pieces (8 by default, 1 = one at a time) and
+                // STRATA_STAGE_INFLIGHT_MIB of rows (512 by default) beyond the ones this stage has taken, so the
+                // earlier stage reads the next pieces while this one reads the chunk before them
+                stage_piece = piece;
+                stage_depth = [&] {
+                    const char* v = std::getenv("STRATA_STAGE_INFLIGHT");
+                    const char* mib = std::getenv("STRATA_STAGE_INFLIGHT_MIB");
+                    const int64_t d = v != nullptr && std::atoi(v) > 0 ? std::atoi(v) : 8;
+                    const int64_t budget = (mib != nullptr && std::atoll(mib) > 0 ? std::atoll(mib) : 512) << 20;
+                    const int64_t per = piece * (int64_t) stage_prev.prompt_floats() * (int64_t) sizeof(float);
+                    return (int) std::max<int64_t>(1, std::min<int64_t>(d, budget / std::max<int64_t>(per, 1)));
+                }();
+                std::fprintf(stderr, "strata serve: prompt pieces of %lld tokens, up to %d ahead\n", (long long) piece,
+                             stage_depth);
+                sp.remote_prev = [&](const int64_t*, int64_t n, int64_t, float* rows, std::string& e) {
+                    return stage_prev.stream_take(n, rows, e);
+                };
+                sp.remote_prev_end = [&] {
+                    if (const int d = stage_prev.stream_end(); d > 0)
+                        std::fprintf(stderr, "strata serve: a prompt read through the earlier stage, up to %d pieces in "
+                                             "flight\n", d);
                 };
             }
         }
@@ -11144,6 +11162,26 @@ int main(int argc, char** argv) {
                 };
             }
         }
+#if !defined(_WIN32)
+        if (sp.remote_prev) {
+            // a run's pieces for the micro-pipeline; the last piece of a chunk where on_chunk will take a periodic
+            // checkpoint asks the earlier stage for one at the same place (the same rule, from pp_next_check)
+            sp.remote_prev_begin = [&](const int64_t* t, int64_t n, int64_t p0, int64_t step, std::string& e) {
+                std::vector<strata::stage::PrevStage::Piece> pieces;
+                int64_t ask_next = pp_next_check;
+                for (int64_t c0 = 0; c0 < n; c0 += step) {
+                    const int64_t c1 = std::min(n, c0 + step);
+                    for (int64_t a = c0; a < c1; a += stage_piece)
+                        pieces.push_back({p0 + a, std::min(stage_piece, c1 - a), false});
+                    if (o.prompt_cache > 0 && o.prompt_cache_every > 0 && p0 + c1 >= ask_next) {
+                        pieces.back().save = true;
+                        ask_next = p0 + c1 + o.prompt_cache_every;
+                    }
+                }
+                return stage_prev.stream_begin(t, std::move(pieces), stage_depth, e);
+            };
+        }
+#endif
         drive.d.plan = ver.plan_sink();
         // Foresight swap space (STRATA_FS_SLOTS; unset = null and nothing changes)
         std::unique_ptr<strata::core::ForesightSwap> fs_swap;
@@ -13498,6 +13536,54 @@ int main(int argc, char** argv) {
             auto room = [&](int64_t cells) {
                 return !kvg.on || kvg_ensure(cells + 64, [&] { cudaDeviceSynchronize(); apply_pending(true); });
             };
+            // THE PROMPT CACHE of a stage: the tokens the session holds (`held`, while `held_ok`: every piece and
+            // committed window went on at its end) and checkpoints of its running state, which the later stage asks
+            // for by their tokens ('S', or 'P' with save) and continues from ('R').  A checkpoint stays while the
+            // session's cells below it still hold its tokens; at most --prompt-cache of them, the least used leave.
+            std::vector<int64_t> held;
+            bool held_ok = true;
+            std::vector<ConvCheckpoint> held_checks;
+            uint64_t held_clock = 0;
+            int64_t win_pos0 = -1;   // a verify window run and not committed yet: its position and tokens
+            std::vector<int32_t> win_toks;
+            auto held_lost = [&](const char* why) {
+                if (held_ok) std::fprintf(stderr, "strata stage: the session no longer follows its tokens (%s)\n", why);
+                held_ok = false;
+                held.clear();
+                held_checks.clear();
+            };
+            auto read_ids = [&](size_t& at, std::vector<int32_t>& ids) -> bool {
+                uint32_t n = 0;
+                if (!sl::get(req, at, n) || req.size() != at + (size_t) n * 4) return false;
+                ids.resize(n);
+                if (n) std::memcpy(ids.data(), req.data() + at, (size_t) n * 4);
+                return true;
+            };
+            auto holds = [&](const std::vector<int32_t>& ids) {
+                if (!held_ok || held.size() != ids.size()) return false;
+                for (size_t i = 0; i < ids.size(); ++i)
+                    if (held[i] != (int64_t) ids[i]) return false;
+                return true;
+            };
+            auto save_held = [&]() -> bool {
+                if (o.prompt_cache <= 0 || held.empty()) return true;
+                for (ConvCheckpoint& c : held_checks)
+                    if (c.ids.size() == held.size()) {
+                        c.used = ++held_clock;
+                        return true;
+                    }
+                ConvCheckpoint c;
+                c.ids.assign(held.begin(), held.end());
+                if (cudaDeviceSynchronize() != cudaSuccess || !checkpoint_save(c, ss, g)) return false;
+                c.used = ++held_clock;
+                held_checks.push_back(std::move(c));
+                while ((int) held_checks.size() > o.prompt_cache)
+                    held_checks.erase(std::min_element(held_checks.begin(), held_checks.end(),
+                                                       [](const ConvCheckpoint& x, const ConvCheckpoint& y) {
+                                                           return x.used < y.used;
+                                                       }));
+                return true;
+            };
             for (;;) {
                 const int cfd = ::accept(lfd, nullptr, nullptr);
                 if (cfd < 0) {
@@ -13508,17 +13594,21 @@ int main(int argc, char** argv) {
                 const int one = 1;
                 ::setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
                 bool hello = false, quit = false;
-                while (sl::recv_frame(cfd, req)) {
+                while (sl::recv_msg(cfd, req)) {
                     std::string e;
                     size_t at = 1;
                     const char op = req.empty() ? 0 : req[0];
                     ans.assign(1, (char) 0);
+                    if (win_pos0 >= 0 && op != 'C') {   // a window that was never committed left the session mid-way
+                        win_pos0 = -1;
+                        held_lost("a verify window was not committed");
+                    }
                     if (!hello && op != 'H') {
                         fail("say hello first");
                     } else if (op == 'H') {
                         if (std::string(req.data() + 1, req.size() - 1) != token) {
                             fail("the stage token does not match");
-                            sl::send_frame(cfd, ans);
+                            sl::send_msg(cfd, ans);
                             break;
                         }
                         hello = true;
@@ -13529,10 +13619,57 @@ int main(int argc, char** argv) {
                     } else if (op == 'Z') {
                         strata::core::session_zero(ss, g, nullptr, main_cs);
                         cudaStreamSynchronize(main_stream);
+                        held.clear();
+                        held_ok = true;
+                        held_checks.clear();
+                        std::fprintf(stderr, "strata stage: a request from position 0\n");
+                    } else if (op == 'R') {
+                        std::vector<int32_t> ids;
+                        ConvCheckpoint* c = nullptr;
+                        if (!read_ids(at, ids)) {
+                            fail("a malformed resume");
+                        } else if (holds(ids)) {
+                            sl::put<uint8_t>(ans, 1);
+                            std::fprintf(stderr, "strata stage: a request continues after %zu tokens (the live session)\n",
+                                         ids.size());
+                        } else if ([&] {
+                                       for (ConvCheckpoint& k : held_checks)
+                                           if (k.ids == ids) c = &k;
+                                       return c == nullptr;
+                                   }()) {
+                            fail("no state of this stage ends after those " + std::to_string(ids.size()) + " tokens");
+                            std::fprintf(stderr, "strata stage: no state to continue after %zu tokens: the request reads "
+                                                 "from position 0\n", ids.size());
+                        } else if (cudaDeviceSynchronize() != cudaSuccess || !checkpoint_restore(*c, ss, g)) {
+                            held_lost("a checkpoint restore failed");
+                            fail("restoring a checkpoint of this stage failed");
+                        } else {
+                            c->used = ++held_clock;
+                            held.assign(ids.begin(), ids.end());
+                            held_ok = true;
+                            held_checks.erase(std::remove_if(held_checks.begin(), held_checks.end(),
+                                                             [&](const ConvCheckpoint& k) {
+                                                                 return k.ids.size() > ids.size() ||
+                                                                        !std::equal(k.ids.begin(), k.ids.end(), ids.begin());
+                                                             }),
+                                              held_checks.end());
+                            sl::put<uint8_t>(ans, 2);
+                            std::fprintf(stderr, "strata stage: a request continues after %zu tokens (a checkpoint)\n",
+                                         ids.size());
+                        }
+                    } else if (op == 'S') {
+                        std::vector<int32_t> ids;
+                        if (!read_ids(at, ids)) fail("a malformed checkpoint request");
+                        else if (!holds(ids)) fail("this stage's session does not hold those " + std::to_string(ids.size()) + " tokens");
+                        else if (!save_held()) fail("saving a checkpoint of this stage failed");
                     } else if (op == 'P') {
                         int64_t pos0 = 0;
                         uint32_t n = 0;
-                        if (!sl::get(req, at, pos0) || !sl::get(req, at, n) || req.size() != at + (size_t) n * 8 || n == 0) {
+                        bool save = false;
+                        const bool shaped = sl::get(req, at, pos0) && sl::get(req, at, n) && n > 0 &&
+                                            (req.size() == at + (size_t) n * 8 ||
+                                             (req.size() == at + (size_t) n * 8 + 1 && (save = req.back() != 0, true)));
+                        if (!shaped) {
                             fail("a malformed prompt chunk");
                         } else if (!room(pos0 + n)) {
                             fail("the K/V cannot grow to " + std::to_string(pos0 + n) + " cells");
@@ -13546,10 +13683,17 @@ int main(int argc, char** argv) {
                                 got += T;
                                 return true;
                             };
+                            if (held_ok && pos0 != (int64_t) held.size()) held_lost("a prompt piece not at its end");
                             const bool ok = sp.run(toks.data(), n, pos0, e);
                             sp.remote_next = nullptr;
-                            if (!ok || got != (int64_t) n) fail(ok ? "the prompt chunk handed off " + std::to_string(got) +
-                                                                         " rows" : e);
+                            if (!ok || got != (int64_t) n) {
+                                fail(ok ? "the prompt chunk handed off " + std::to_string(got) + " rows" : e);
+                                held_lost("a prompt piece failed");
+                            } else if (held_ok) {
+                                held.insert(held.end(), toks.begin(), toks.end());
+                                if (save && !save_held()) std::fprintf(stderr, "strata stage: a checkpoint at %zu tokens "
+                                                                               "was not saved\n", held.size());
+                            }
                         }
                     } else if (op == 'W') {
                         int64_t pos0 = 0;
@@ -13568,20 +13712,36 @@ int main(int argc, char** argv) {
                             if (!ver.run((int) T, toks.data(), pos0, win_pool_fn, win_pool_user, picks.data(), e) ||
                                 drive.d.failed) {
                                 fail(drive.d.failed && drive.d.fail ? std::string(drive.d.fail) : e);
+                                held_lost("a verify window failed");
                             } else {
                                 sl::put_bytes(ans, stage_hand_out, (size_t) T * wf * sizeof(float));
+                                if (held_ok && pos0 != (int64_t) held.size()) held_lost("a verify window not at its end");
+                                if (held_ok) {
+                                    win_pos0 = pos0;
+                                    win_toks = toks;
+                                }
                             }
                         }
                     } else if (op == 'C') {
                         uint32_t n = 0;
-                        if (!sl::get(req, at, n) || !ver.commit((int) n, e) || !ver.wait_commit(e))
+                        const bool pending = win_pos0 >= 0;
+                        win_pos0 = -1;
+                        if (!sl::get(req, at, n) || !ver.commit((int) n, e) || !ver.wait_commit(e)) {
                             fail(e.empty() ? "a malformed commit" : e);
+                            held_lost("a commit failed");
+                        } else if (pending && held_ok && n <= win_toks.size()) {
+                            held.insert(held.end(), win_toks.begin(), win_toks.begin() + n);
+                        } else if (held_ok) {
+                            held_lost("a commit without its window");
+                        }
                     } else if (op == 'Q') {
                         quit = true;
                     } else {
                         fail(std::string("unknown request ") + op);
                     }
-                    if (!sl::send_frame(cfd, ans) || quit) break;
+                    // the rows of a piece or a window go as a tensor (the POM carries them in the deployment's precision)
+                    const bool rows = (op == 'P' || op == 'W') && ans.size() > 1 && ans[0] == 0;
+                    if (!sl::send_msg(cfd, ans, rows ? 1 : 0) || quit) break;
                 }
                 ::close(cfd);
                 if (quit) break;
@@ -13748,6 +13908,7 @@ int main(int argc, char** argv) {
                 strata::core::conversation_park_join();   // (STRATA_PARK_ASYNC: the last park's K/V)
                 if (path.empty()) { refuse("missing path"); continue; }
                 if (!stages.empty() || multi_gpu) { refuse("session files do not support --layer-split"); continue; }
+                if (stage_mode) { refuse("session files do not support a stage per process"); continue; }
                 if (o.peer_device >= 1) { refuse("session files do not support --peer-device"); continue; }
                 if (o.batch > 0) { refuse("session files do not support --batch (parallel requests)"); continue; }
                 if (o.prompt_cache <= 0) { refuse("session files need --prompt-cache > 0"); continue; }
@@ -14701,6 +14862,33 @@ int main(int argc, char** argv) {
                 cvec_cached = want_cvec;
             }
             if (strata::kernels::cvec().loaded()) strata::kernels::cvec_set_enabled(want_cvec);
+#if !defined(_WIN32)
+            // a stage per process: the earlier stage must continue after the same tokens, from its live session or
+            // its checkpoint of them; a source it does not hold goes, and the next longest one is tried
+            while (stage_mode && o.stage_lo > 0 && resume > 0) {
+                int how = 0;
+                std::string rerr;
+                if (stage_prev.resume(cur.data(), resume, how, rerr)) {
+                    std::fprintf(stderr, "strata serve: the earlier stage continues after %lld tokens (%s)\n",
+                                 (long long) resume, how == 1 ? "its live session" : "its checkpoint");
+                    break;
+                }
+                std::fprintf(stderr, "strata serve: the earlier stage cannot continue after %lld tokens: %s\n",
+                             (long long) resume, rerr.c_str());
+                if (from_live) live_ok = false;
+                else checks.erase(std::remove_if(checks.begin(), checks.end(), [&](const ConvCheckpoint& c) {
+                                      return (int64_t) c.ids.size() == resume;
+                                  }), checks.end());
+                const int64_t tried = resume;
+                const bool was_live = from_live;
+                resume = 0;
+                from_live = false;
+                for (const ConvCheckpoint& c : checks) {
+                    const int64_t L = (int64_t) c.ids.size();
+                    if (L > resume && (L < tried || (was_live && L == tried)) && starts_with(c.ids, c.imgs)) resume = L;
+                }
+            }
+#endif
             // this request rewrites every cell from `resume` on, so a checkpoint past it (or not on this prompt's
             // path) no longer has its cells; the ones kept are prefixes of both the old tokens and the new
             auto off_path = [&](const ConvCheckpoint& c) {
@@ -14751,7 +14939,7 @@ int main(int argc, char** argv) {
                 if (!lent) lent_slot = -1;
                 if (c != nullptr) c->used = ++check_clock;   // mounting through it is the use LRU counts
                 static const bool reread = std::getenv("STRATA_CKPT_REREAD") != nullptr;
-                if (reread && c != nullptr) {
+                if (reread && c != nullptr && !stage_mode) {   // a stage split: the earlier stage has continued
                     // THE CHECK OF THE CHECKPOINT: instead of restoring it, read its tokens again from position 0 in
                     // one run (below, with the prompt path's slots lent like any read) - the same chunks the request
                     // that saved it read them in, when that request started at 0.  With the VRAM expert set fixed
@@ -15928,6 +16116,15 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: checkpoint at %lld skipped: its state could not be copied out (see "
                                          "above); the request goes on without it\n", (long long) to);
                 }
+#if !defined(_WIN32)
+                if (stage_mode && o.stage_lo > 0 && o.prompt_cache > 0 && req_ckpt &&
+                    (to == turn_at || to == root_at || to == message_at || to == pin_at)) {
+                    std::string serr;   // the earlier stage's own checkpoint there; without it this one is not continued
+                    if (!stage_prev.save(ids.data(), to, serr))
+                        std::fprintf(stderr, "strata serve: the earlier stage kept no checkpoint at %lld: %s\n",
+                                     (long long) to, serr.c_str());
+                }
+#endif
                 if (to == pin_at && !pin_checkpoint(pin_at))
                     std::fprintf(stderr, "strata serve: pin=%lld: its checkpoint was not kept\n", (long long) pin_at);
                 if (trace && to == message_at)
