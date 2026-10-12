@@ -4111,6 +4111,11 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
     if (remote_prev && stage_lb_ > 0) {
         // a stage per process: the earlier stage reads each chunk in its process and hands its rows here
         const int64_t step = std::max<int64_t>(1, chunk());
+        if (remote_prev_begin && !remote_prev_begin(tokens, n, pos0, step, err)) return false;
+        struct End {
+            const std::function<void()>& f;
+            ~End() { if (f) f(); }
+        } end{remote_prev_end};
         for (int64_t c0 = 0; c0 < n; c0 += step) {
             const int64_t T = std::min(step, n - c0);
             if (!remote_rows(T, err) || !remote_prev(tokens + c0, T, pos0 + c0, remote_rows_, err)) return false;

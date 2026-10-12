@@ -12,15 +12,33 @@
 //
 //   'H' token                        -> u32 lo, u32 hi, u32 window_floats, u32 prompt_floats
 //   'Z'                              -> (the stage's session zeroed: a new request starts at position 0)
-//   'P' i64 pos0, u32 n, i64 tok[n]  -> f32 rows[n * prompt_floats]   (the prompt chunk read through the stage)
+//   'R' u32 n, i32 ids[n]            -> u8 how (1 = its live session, 2 = a checkpoint)   (continue after ids)
+//   'S' u32 n, i32 ids[n]            -> (a checkpoint of the session as it is, which holds exactly ids)
+//   'P' i64 pos0, u32 n, i64 tok[n], u8 save  -> f32 rows[n * prompt_floats]   (the prompt piece read through the
+//                                       stage; save = 1: a checkpoint at its end, as the later stage takes there)
 //   'W' i64 pos0, u32 T, i32 tok[T]  -> f32 rows[T * window_floats]   (a verify window read through the stage)
 //   'C' u32 n_keep                   -> (the window's first n_keep tokens kept)
 //   'Q'                              -> (the stage server ends)
+//
+// The stage server answers in order, so the later stage may send several 'P' before it reads the first answer: the
+// earlier stage reads piece k + 1 while the later one reads piece k (PrevStage::stream_begin, a micro-pipeline).
+// THE POM'S LINK FRAMES: every payload above travels in the POM's envelope for an engine's stage link - a kind byte
+// first: 1, the bytes as they are; 2, a tensor: u32 n_meta, the first n_meta bytes, then f32 values.  The rows of a
+// 'P' or 'W' answer go as a tensor (the status byte is its meta), so the POM node between the machines carries them
+// in the deployment's hidden-state precision (f16, f8, int4 ...) and hands them back as f32: the engines never see
+// another precision (send_msg, recv_msg).
+// 'R' fails when the earlier stage holds no state that ends with exactly those tokens; the later stage then reads
+// the prompt from position 0 ('Z').
 #pragma once
 
+#include <algorithm>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
+#include <deque>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #if !defined(_WIN32)
@@ -68,6 +86,41 @@ inline bool recv_frame(int fd, std::vector<char>& payload, uint32_t max_bytes = 
     if (!read_all(fd, &n, 4) || n > max_bytes) return false;
     payload.resize(n);
     return n == 0 || read_all(fd, payload.data(), n);
+}
+
+/// A message in the POM's link envelope: `body` as it is, or - with `tensor_from` > 0 - as a tensor whose meta is
+/// the first `tensor_from` bytes and whose f32 values are the rest.
+inline bool send_msg(int fd, const std::vector<char>& body, size_t tensor_from = 0) {
+    char head[9];
+    size_t hn = 0;
+    const uint32_t n = (uint32_t) (body.size() + (tensor_from > 0 ? 5 : 1));
+    std::memcpy(head, &n, 4);
+    head[4] = tensor_from > 0 ? 2 : 1;
+    hn = 5;
+    if (tensor_from > 0) {
+        const uint32_t m = (uint32_t) tensor_from;
+        std::memcpy(head + 5, &m, 4);
+        hn = 9;
+    }
+    return write_all(fd, head, hn) && write_all(fd, body.data(), body.size());
+}
+
+/// The body of a message in the POM's link envelope (a tensor's meta, then its values).
+inline bool recv_msg(int fd, std::vector<char>& body, uint32_t max_bytes = 1u << 31) {
+    uint32_t n = 0;
+    uint8_t kind = 0;
+    if (!read_all(fd, &n, 4) || n < 1 || n > max_bytes || !read_all(fd, &kind, 1)) return false;
+    n -= 1;
+    if (kind == 2) {
+        uint32_t m = 0;
+        if (n < 4 || !read_all(fd, &m, 4)) return false;
+        n -= 4;
+        if (m > n || (n - m) % 4 != 0) return false;
+    } else if (kind != 1) {
+        return false;
+    }
+    body.resize(n);
+    return n == 0 || read_all(fd, body.data(), n);
 }
 
 template <class T> void put(std::vector<char>& b, T v) {
@@ -134,7 +187,10 @@ inline int tcp_open(const std::string& addr, bool listen, std::string& err, int*
 /// The later stage's side: asks the earlier stage, over one connection, for its rows.
 class PrevStage {
 public:
-    ~PrevStage() { if (fd_ >= 0) ::close(fd_); }
+    ~PrevStage() {
+        stream_end();
+        if (fd_ >= 0) ::close(fd_);
+    }
 
     /// Connects and checks that the earlier stage ends where this one starts.
     bool connect(const std::string& addr, const std::string& token, int64_t my_lo, std::string& err) {
@@ -167,12 +223,18 @@ public:
         std::vector<char> ans;
         return call(std::vector<char>{'Z'}, ans, err);
     }
-    bool prefill(const int64_t* tokens, int64_t n, int64_t pos0, float* rows, std::string& err) {
-        std::vector<char> req{'P'};
-        put<int64_t>(req, pos0);
-        put<uint32_t>(req, (uint32_t) n);
-        put_bytes(req, tokens, (size_t) n * sizeof(int64_t));
-        return rows_call(req, rows, (size_t) n * prompt_floats_, err);
+    /// The earlier stage continues after `ids` (its live session or a checkpoint of them); `how` is 1 or 2.  False
+    /// with `err` when it cannot: the caller reads the prompt from position 0.
+    bool resume(const int64_t* ids, int64_t n, int& how, std::string& err) {
+        std::vector<char> ans;
+        if (!call(ids_request('R', ids, n), ans, err)) return false;
+        how = ans.size() > 1 ? (int) (uint8_t) ans[1] : 0;
+        return true;
+    }
+    /// The earlier stage keeps a checkpoint of its session, which holds exactly `ids`.
+    bool save(const int64_t* ids, int64_t n, std::string& err) {
+        std::vector<char> ans;
+        return call(ids_request('S', ids, n), ans, err);
     }
     bool window(int T, const int32_t* tokens, int64_t pos0, float* rows, std::string& err) {
         std::vector<char> req{'W'};
@@ -188,14 +250,187 @@ public:
         return call(req, ans, err);
     }
 
+    /// A piece of a prompt read through the earlier stage: one 'P' request.
+    struct Piece {
+        int64_t pos0 = 0, n = 0;
+        bool save = false;   ///< the earlier stage takes a checkpoint at its end
+    };
+    /// THE MICRO-PIPELINE of a prompt read: a thread sends the pieces' requests (`tokens` are the prompt from the
+    /// first piece's position) and keeps up to `depth` of them ahead of the ones `stream_take` has taken, so the
+    /// earlier stage reads the next pieces while this one computes.  `tokens` must stay valid until `stream_end`.
+    bool stream_begin(const int64_t* tokens, std::vector<Piece> pieces, int depth, std::string& err) {
+        stream_end();
+        if (fd_ < 0) { err = "the earlier stage is not connected"; return false; }
+        st_tokens_ = tokens;
+        st_pieces_ = std::move(pieces);
+        st_depth_ = std::max(1, depth);
+        st_sent_ = st_taken_ = 0;
+        st_ready_.clear();
+        st_err_.clear();
+        st_stop_ = false;
+        st_failed_ = false;
+        st_depth_max_ = 0;
+        st_thread_ = std::thread([this] { stream_loop(); });
+        return true;
+    }
+    /// The rows of the next `n` tokens of the stream (whole pieces), in order.
+    bool stream_take(int64_t n, float* rows, std::string& err) {
+        const size_t pf = prompt_floats_;
+        int64_t got = 0;
+        while (got < n) {
+            std::vector<float> ans;
+            int64_t m = 0;
+            {
+                std::unique_lock<std::mutex> lk(st_mu_);
+                st_cv_.wait(lk, [&] { return !st_ready_.empty() || st_failed_; });
+                if (st_ready_.empty()) {
+                    err = st_err_;
+                    return false;
+                }
+                ans = std::move(st_ready_.front());
+                st_ready_.pop_front();
+                m = st_pieces_[st_taken_].n;
+                ++st_taken_;
+            }
+            st_cv_.notify_all();
+            if (got + m > n) {
+                err = "the stage stream's pieces do not end where the chunk ends";
+                return false;
+            }
+            std::memcpy(rows + (size_t) got * pf, ans.data(), (size_t) m * pf * sizeof(float));
+            got += m;
+        }
+        return true;
+    }
+    /// Ends the stream: no new piece is asked for and the answers already asked for are read (the connection stays
+    /// in step).  The greatest number of pieces that were in flight at once.
+    int stream_end() {
+        if (st_thread_.joinable()) {
+            {
+                std::lock_guard<std::mutex> lk(st_mu_);
+                st_stop_ = true;
+            }
+            st_cv_.notify_all();
+            st_thread_.join();
+        }
+        st_ready_.clear();
+        st_pieces_.clear();
+        return st_depth_max_;
+    }
+
 private:
     int fd_ = -1;
     uint32_t window_floats_ = 0, prompt_floats_ = 0;
     std::vector<char> ans_;
+    // the stream (stream_begin): the pieces, how many were sent and taken, the answers not taken yet
+    const int64_t* st_tokens_ = nullptr;
+    std::vector<Piece> st_pieces_;
+    int st_depth_ = 1, st_depth_max_ = 0;
+    size_t st_sent_ = 0, st_taken_ = 0;
+    std::deque<std::vector<float>> st_ready_;
+    std::string st_err_;
+    bool st_stop_ = false, st_failed_ = false;
+    std::mutex st_mu_;
+    std::condition_variable st_cv_;
+    std::thread st_thread_;
+
+    static std::vector<char> ids_request(char op, const int64_t* ids, int64_t n) {
+        std::vector<char> req{op};
+        put<uint32_t>(req, (uint32_t) n);
+        for (int64_t i = 0; i < n; ++i) put<int32_t>(req, (int32_t) ids[i]);
+        return req;
+    }
+
+    void stream_fail(const std::string& e) {
+        {
+            std::lock_guard<std::mutex> lk(st_mu_);
+            if (!st_failed_) st_err_ = e;
+            st_failed_ = true;
+        }
+        st_cv_.notify_all();
+    }
+
+    // The stream's thread: sends while fewer than `depth` pieces are ahead of the taken ones, else reads the oldest
+    // answer.  After stream_end it sends nothing more and reads what it has sent.
+    void stream_loop() {
+        const size_t pf = prompt_floats_;
+        size_t received = 0;
+        const int64_t base = st_pieces_.empty() ? 0 : st_pieces_.front().pos0;
+        for (;;) {
+            bool send_one = false;
+            {
+                std::unique_lock<std::mutex> lk(st_mu_);
+                // memory: the answers received and not taken count against the depth as the ones in flight do
+                st_cv_.wait(lk, [&] {
+                    return st_stop_ || st_failed_ || received < st_sent_ ||
+                           (st_sent_ < st_pieces_.size() && st_sent_ - st_taken_ < (size_t) st_depth_);
+                });
+                if (st_failed_ || (st_stop_ && received == st_sent_)) return;
+                send_one = !st_stop_ && st_sent_ < st_pieces_.size() && st_sent_ - st_taken_ < (size_t) st_depth_;
+                if (!send_one && received == st_sent_) continue;
+            }
+            if (send_one) {
+                const Piece& p = st_pieces_[st_sent_];
+                std::vector<char> req{'P'};
+                put<int64_t>(req, p.pos0);
+                put<uint32_t>(req, (uint32_t) p.n);
+                put_bytes(req, st_tokens_ + (p.pos0 - base), (size_t) p.n * sizeof(int64_t));
+                put<uint8_t>(req, p.save ? 1 : 0);
+                if (!send_msg(fd_, req)) {
+                    lost();
+                    return;
+                }
+                std::lock_guard<std::mutex> lk(st_mu_);
+                ++st_sent_;
+                st_depth_max_ = std::max(st_depth_max_, (int) (st_sent_ - received));
+                // keep sending while the window has room: the answers wait in the socket
+                if (st_sent_ < st_pieces_.size() && st_sent_ - st_taken_ < (size_t) st_depth_ && !st_stop_) continue;
+            }
+            std::vector<char> ans;
+            if (!recv_msg(fd_, ans)) {
+                lost();
+                return;
+            }
+            const Piece& p = st_pieces_[received++];
+            if (ans.empty() || ans[0] != 0) {
+                stream_fail("the earlier stage: " +
+                            (ans.size() > 1 ? std::string(ans.data() + 1, ans.size() - 1) : std::string("error")));
+                drain(received);
+                return;
+            }
+            std::vector<float> rows((size_t) p.n * pf);
+            if (ans.size() != 1 + rows.size() * sizeof(float)) {
+                stream_fail("the earlier stage answered " + std::to_string(ans.size() - 1) + " bytes of rows, expected " +
+                            std::to_string(rows.size() * sizeof(float)));
+                drain(received);
+                return;
+            }
+            std::memcpy(rows.data(), ans.data() + 1, rows.size() * sizeof(float));
+            {
+                std::lock_guard<std::mutex> lk(st_mu_);
+                if (!st_stop_) st_ready_.push_back(std::move(rows));
+            }
+            st_cv_.notify_all();
+        }
+    }
+    // after a failed piece: the answers to the pieces already sent still come, read and dropped
+    void drain(size_t received) {
+        std::vector<char> ans;
+        for (size_t sent = st_sent_; received < sent; ++received)
+            if (!recv_msg(fd_, ans)) {
+                lost();
+                return;
+            }
+    }
+    void lost() {
+        stream_fail("the earlier stage's connection was lost");
+        ::close(fd_);
+        fd_ = -1;
+    }
 
     bool call(const std::vector<char>& req, std::vector<char>& ans, std::string& err) {
         if (fd_ < 0) { err = "the earlier stage is not connected"; return false; }
-        if (!send_frame(fd_, req) || !recv_frame(fd_, ans)) {
+        if (!send_msg(fd_, req) || !recv_msg(fd_, ans)) {
             err = "the earlier stage's connection was lost";
             ::close(fd_);
             fd_ = -1;

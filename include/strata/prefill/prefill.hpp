@@ -156,6 +156,11 @@ public:
     /// `run` asks `remote_prev` for each chunk's residual rows (host, T x hc*n_embd) instead of a local `next`
     /// chain: (tokens, T, pos0, rows, err).  Needs `set_stage` with a first layer above 0.
     std::function<bool(const int64_t*, int64_t, int64_t, float*, std::string&)> remote_prev;
+    /// Optional, beside `remote_prev`: called once before a run's chunks with the whole run (tokens, n, pos0, the
+    /// chunk size) so the rows can be asked for ahead (a micro-pipeline), and `remote_prev_end` once after them,
+    /// however the run ended.
+    std::function<bool(const int64_t*, int64_t, int64_t, int64_t, std::string&)> remote_prev_begin;
+    std::function<void()> remote_prev_end;
     /// The other side: this stage's last layer is not the model's, and its rows of each chunk (host, T x
     /// hc*n_embd, valid during the call) go to the next stage in another process: (rows, T, pos0, err).
     std::function<bool(const float*, int64_t, int64_t, std::string&)> remote_next;
