@@ -1077,9 +1077,11 @@ class StrataEngine:
                 return line
         return None
 
-    def _await_bdone(self, slot: int) -> bool:
-        """Reads a slot's lines until its BDONE (its turn is over in the engine). True when it came."""
+    def _await_bdone(self, slot: int, tail: list[int]):
+        """Reads a slot's lines until its BDONE (its turn is over in the engine): (finish, the tokens the slot fed, with
+        the BT lines still to come) or None when it does not come."""
         q = self.slot_q[slot]
+        tail = list(tail)
         end = time.monotonic() + 60.0
         while time.monotonic() < end:
             try:
@@ -1087,10 +1089,16 @@ class StrataEngine:
             except queue.Empty:
                 continue
             if line is None:
-                return False
+                return None
+            if line.startswith("BT "):
+                try:
+                    tail.append(int(line.split()[2]))
+                except (IndexError, ValueError):
+                    return None
             if line.startswith("BDONE "):
-                return True
-        return False
+                f = line.split()
+                return (f[3] if len(f) > 3 else "", tail)
+        return None
 
     def _release_slot_when_done(self, slot: int, stream: list[int] | None = None):
         """A slot whose consumer left (a stop token, a stop string, a disconnect): BSTOP it and free it once the engine
@@ -1433,15 +1441,18 @@ class StrataEngine:
                 self.slot_used[slot] = time.time()
                 # a turn that ended on its own token (the consumer stopped at the EOS, or the length) is handed to its
                 # owner in the same way as at BDONE: the engine's BDONE comes at once, the slot holds the turn until then
-                natural = (phase == "slot" and turn_hook is not None and gen0 is not None and bool(out)
-                           and (out[-1] in EOS_IDS or len(out) >= int(max_new)))
-                if natural and self._await_bdone(slot):
-                    held_now = list(prompt) + out[gen0:-1]
-                    self.slot_held[slot] = held_now
-                    try:
-                        turn_hook(slot, list(held_now))
-                    except Exception as error:
-                        print(f"strata serve: turn hook failed: {error}", file=sys.stderr, flush=True)
+                # the engine says how the turn ended (BDONE's finish): stop or length hands the turn to its owner
+                ended = (self._await_bdone(slot, list(prompt) + out[gen0:])
+                         if phase == "slot" and turn_hook is not None and gen0 is not None and not cancel.is_set()
+                         else None)
+                if ended is not None:
+                    fin, tokens = ended
+                    self.slot_held[slot] = list(tokens[:-1]) if tokens else []
+                    if fin in ("stop", "length"):
+                        try:
+                            turn_hook(slot, list(self.slot_held[slot]))
+                        except Exception as error:
+                            print(f"strata serve: turn hook failed: {error}", file=sys.stderr, flush=True)
                     with self.slot_cv:
                         self.slot_busy[slot] = False
                         self.slot_cv.notify_all()
