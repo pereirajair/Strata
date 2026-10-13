@@ -307,7 +307,7 @@ class SessionRefused(ValueError):
     <reason>`).  `kind` is the engine's category - invalid (400), storage (507), memory (503), io (500); `published`:
     a save whose new file already replaced the old one before a later step (the folder flush) failed."""
 
-    STATUS = {"invalid": 400, "storage": 507, "memory": 503, "io": 500}
+    STATUS = {"invalid": 400, "storage": 507, "memory": 503, "io": 500, "busy": 409}
 
     def __init__(self, kind: str, message: str, published: bool = False):
         super().__init__(message)
@@ -1640,7 +1640,40 @@ class StrataEngine:
             pass
         return EngineSilent(f"{what}; the server ended the engine")
 
-    def session_file(self, action: str, path: str) -> dict:
+    def session_file(self, action: str, path: str, slot: int | None = None, ids: list[int] | None = None) -> dict:
+        """A disk session (see `_session_round`).  `slot`: one batch slot's session, `SAVE @<slot>` / `RESTORE @<slot>`.
+        It needs every slot idle (the engine runs nothing else meanwhile), and the slot is busy while it moves.  A save
+        returns the tokens the slot holds (`ids`); a restore sets them, as the slot's held tokens for the next turn
+        (`ids` is required).  A failed restore leaves the slot holding nothing: its state is no longer known."""
+        if slot is None:
+            return self._session_round(action, path, None)
+        if not getattr(self, "batch", 0) or not 0 <= int(slot) < self.batch:
+            raise ValueError(f"no batch slot {slot}")
+        if action.startswith("restore") and ids is None:
+            raise ValueError("a slot restore needs the tokens the session holds")
+        with self.slot_cv:
+            if any(self.slot_busy):
+                raise SessionRefused("busy", "a batch slot is busy: the session waits until every slot is idle")
+            self.slot_busy[slot] = True
+        try:
+            try:
+                result = self._session_round(action, path, slot)
+            except Exception:
+                if action.startswith("restore"):
+                    self.slot_held[slot] = []
+                raise
+            if action.startswith("restore"):
+                self.slot_held[slot] = list(ids)
+            else:
+                result["ids"] = list(self.slot_held[slot])
+            self.slot_used[slot] = time.time()
+            return result
+        finally:
+            with self.slot_cv:
+                self.slot_busy[slot] = False
+                self.slot_cv.notify_all()
+
+    def _session_round(self, action: str, path: str, slot: int | None) -> dict:
         """Disk sessions: `SAVE <path>` / `RESTORE <path>` between requests (the caller holds the service FIFO).
         -> {"tokens", "bytes", "ms"}.  SessionRefused (kind, published) when the engine refused or failed the file and
         is still in step (`SERR <kind> <0|1> <reason>`).  Any line this exchange does not allow - an unknown or
@@ -1658,7 +1691,8 @@ class StrataEngine:
         word = {"save": "SAVE", "restore": "RESTORE", "save_delta": "SAVE_DELTA", "restore_delta": "RESTORE_DELTA"}[action]
         save = action in ("save", "save_delta")
         try:
-            self.proc.stdin.write(f"{word} {path}\n")
+            target = f"{word} @{slot} {path}" if slot is not None else f"{word} {path}"
+            self.proc.stdin.write(target + "\n")
             self.proc.stdin.flush()
         except OSError:
             raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
