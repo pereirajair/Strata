@@ -14308,7 +14308,17 @@ int main(int argc, char** argv) {
                     target.partial = false;
                     target.stop = false;
                     for (const ConvCheckpoint& c : target.checks) check_clock = std::max(check_clock, c.used);
-                    // the slot's full image is the base its next delta applies to
+                    // the next SAVE_DELTA @slot is cut from the image this slot now holds, as a save would leave it
+                    DeltaBase& base = slot_delta_base[(size_t) slot];
+                    base.valid = true;
+                    base.ids = image.live.ids;
+                    base.cells.clear();
+                    base.pooled.clear();
+                    for (const auto& kv : image.kv) {
+                        base.cells.push_back(kv.cells);
+                        base.pooled.push_back(kv.pooled_rows);
+                    }
+                    // the slot's full image is the base its next RESTORE_DELTA @slot applies to
                     image.live.ids = target.ids;
                     image.checkpoints.clear();
                     slot_delta_image[(size_t) slot] = std::move(image);
