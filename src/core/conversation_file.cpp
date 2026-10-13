@@ -679,12 +679,16 @@ void put_kv_header(Out& o, int format, int64_t cells, int64_t heads, int64_t hea
     for (int64_t v : {int64_t(format), cells, heads, head_dim, page_size, pooled_rows, idx_dim}) o.i64(v);
 }
 
-void put_checkpoint(Out& o, const ConversationCheckpoint& c) {
+// The running state of a layer split's later GPUs (stage_parts): one part per later stage, each a plain running state.
+void put_checkpoint(Out& o, const ConversationCheckpoint& c, bool with_parts = true) {
     o.vec(c.ids);
     o.u64(c.imgs.size());
     for (const auto& k : c.imgs) { o.i64(k.start); o.u64(k.hash); }
     o.vec(c.gdn); o.vec(c.ple); o.vec(c.tails); o.vec(c.dead); o.vec(c.block_pos);
     o.u64(c.used);
+    if (!with_parts) return;
+    o.u64(c.stage_parts.size());
+    for (const auto& p : c.stage_parts) put_checkpoint(o, p, false);
 }
 
 // `stages`: the image's own layer-split stages follow it (a stage's own stages are not written: there is one level).
@@ -758,15 +762,22 @@ struct In {
     }
 };
 
-bool get_checkpoint(In& in, ConversationCheckpoint& c) {
+bool get_checkpoint(In& in, ConversationCheckpoint& c, bool with_parts = true) {
     if (!in.vec(c.ids, in.limits.max_tokens)) return false;
     uint64_t n = 0;
     if (!in.count(n, 16, in.limits.max_tokens)) return false;
     c.imgs.resize((size_t) n);
     for (auto& k : c.imgs) if (!in.i64(k.start) || !in.u64(k.hash)) return false;
     const auto& m = in.limits.max_state_bytes;   // byte arrays: element and byte counts are the same
-    return in.vec(c.gdn, m[0]) && in.vec(c.ple, m[1]) && in.vec(c.tails, m[2]) && in.vec(c.dead, m[3]) &&
-           in.vec(c.block_pos, m[4]) && in.u64(c.used);
+    if (!(in.vec(c.gdn, m[0]) && in.vec(c.ple, m[1]) && in.vec(c.tails, m[2]) && in.vec(c.dead, m[3]) &&
+          in.vec(c.block_pos, m[4]) && in.u64(c.used)))
+        return false;
+    if (!with_parts) return true;
+    uint64_t parts = 0;
+    if (!in.count(parts, 72, in.limits.max_stages)) return false;
+    c.stage_parts.resize((size_t) parts);
+    for (auto& p : c.stage_parts) if (!get_checkpoint(in, p, false)) return false;
+    return true;
 }
 
 bool get_payload(In& in, SavedConversation& s, bool stages = true) {
@@ -1041,7 +1052,13 @@ bool write_impl(const std::string& path, const SavedConversation& image, const s
                 SessionStatus& st) {
     st = {};
     st.error = SessionError::invalid;   // refusals before any disk access
-    if (has_stage_parts(image)) { error = "session file: layer-split state cannot be saved"; return false; }
+    // a layer split's running state carries one part per later stage, and those stages' images come with it
+    auto parts_complete = [&](const ConversationCheckpoint& c) {
+        return c.stage_parts.empty() || c.stage_parts.size() == image.stage_images.size();
+    };
+    bool complete = parts_complete(image.live);
+    for (const auto& c : image.checkpoints) complete = complete && parts_complete(c);
+    if (!complete) { error = "session file: layer-split state is incomplete (a part for each later stage)"; return false; }
     for (const auto& st : image.stage_images)
         if (has_stage_parts(st) || !st.stage_images.empty()) { error = "session file: a stage's own stages are not saved"; return false; }
     if (sources && !image.kv.empty()) { error = "session file: K/V given both in the image and as sources"; return false; }
