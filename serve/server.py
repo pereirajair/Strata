@@ -2442,16 +2442,19 @@ class StrataEngine:
         a step that blocks in one call (a flush, the device transfer): until the next line the wait is that step's
         explicit allowance (at most SESSION_WAIT_MAX_S) when it is longer than engine_silence_s - no more, so a step
         that never ends is still ended."""
-        if action not in ("save", "restore") or any(c in path for c in "\r\n\0"):
+        if action not in ("save", "restore", "save_delta", "restore_delta") or any(c in path for c in "\r\n\0"):
             raise ValueError("invalid session command")
+        # the engine's command word, and the answer it prints: a delta is answered like a whole session
+        word = {"save": "SAVE", "restore": "RESTORE", "save_delta": "SAVE_DELTA", "restore_delta": "RESTORE_DELTA"}[action]
+        save = action in ("save", "save_delta")
         try:
-            self.proc.stdin.write(f"{'SAVE' if action == 'save' else 'RESTORE'} {path}\n")
+            self.proc.stdin.write(f"{word} {path}\n")
             self.proc.stdin.flush()
         except OSError:
             raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
         silence = float(self.silence_s or 0)
         heard = time.monotonic()
-        want = "SAVED" if action == "save" else "RESTORED"
+        want = "SAVED" if save else "RESTORED"
 
         def out_of_step(line: str) -> EngineDied:
             self.ended = True                               # not alive from now: the next request restarts it
