@@ -10306,6 +10306,7 @@ int main(int argc, char** argv) {
             std::vector<int64_t> cells, pooled;
         } delta_base;
         std::optional<strata::core::SavedConversation> delta_image;
+        std::vector<DeltaBase> slot_delta_base((size_t) std::max(o.batch, 0));   // the same, per batch slot
         int64_t tail_ckpt_len = -1;   // --prompt-cache-tail: the length of the one tail checkpoint alive (-1 = none)
         // --prefill-pipe: the plan of the prompt segment being read (read_part sets it around its runs), for the
         // checkpoints taken inside it
@@ -13452,7 +13453,16 @@ int main(int argc, char** argv) {
             if (line.rfind("SAVE ", 0) == 0 || line.rfind("RESTORE ", 0) == 0 || delta_cmd) {
                 const bool save = line[0] == 'S';
                 const bool delta = delta_cmd;
-                const std::string path = line.substr(save ? (delta ? 11 : 5) : (delta ? 14 : 8));
+                std::string path = line.substr(save ? (delta ? 11 : 5) : (delta ? 14 : 8));
+                // "@<slot> <path>": the batch slot's conversation, not the session's
+                int slot = -1;
+                if (path.size() > 2 && path[0] == '@') {
+                    const size_t sp = path.find(' ');
+                    if (sp != std::string::npos) {
+                        slot = std::atoi(path.substr(1, sp - 1).c_str());
+                        path = path.substr(sp + 1);
+                    }
+                }
                 const auto t0 = Clock::now();
                 auto ms = [&] { return std::chrono::duration<double, std::milli>(Clock::now() - t0).count(); };
                 auto refuse = [&](const std::string& why, strata::core::SessionError kind = strata::core::SessionError::invalid,
@@ -13507,13 +13517,11 @@ int main(int argc, char** argv) {
                     refuse(std::string("session identity: ") + e.what(), strata::core::SessionError::io);
                     continue;
                 }
-                if (save) {
-                    if (!live_ok || live.empty()) { refuse("no complete session to save"); continue; }
                     // The save of one conversation (the live state, its checkpoints, the K/V streamed to the file - whole,
                     // or as a delta). A refusal is answered inside; false means one was.
                     auto save_session = [&](strata::core::SessionState& ss, const std::vector<int32_t>& live,
                                             const std::vector<ImgKey>& live_imgs, std::vector<ConvCheckpoint>& checks,
-                                            bool cvec_cached, const auto& draft) -> bool {
+                                            bool cvec_cached, const auto& draft, DeltaBase& delta_base) -> bool {
                     size_t bytes = 0, kept = 0;
                     double capture_ms = 0;
                     try {
@@ -13635,7 +13643,18 @@ int main(int argc, char** argv) {
                     std::printf("SAVED %zu %zu %.1f\n", live.size(), bytes, ms());
                         return true;
                     };
-                    if (!save_session(ss, live, live_imgs, checks, cvec_cached, mtp.kv_state())) continue;
+                if (save && slot >= 0) {
+                    if (bslot_ss.empty() || slot >= (int) bs.size() || bs[(size_t) slot].active ||
+                        bs[(size_t) slot].ids.empty() || bs[(size_t) slot].img) {
+                        refuse("no idle batch slot with a conversation to save");
+                        continue;
+                    }
+                    BSlot& sl_state = bs[(size_t) slot];
+                    if (!save_session(*bslot_ss[0][(size_t) slot], sl_state.ids, std::vector<ImgKey>{}, sl_state.checks,
+                                      true, mtp.kv_state(), slot_delta_base[(size_t) slot])) continue;
+                } else if (save) {
+                    if (!live_ok || live.empty()) { refuse("no complete session to save"); continue; }
+                    if (!save_session(ss, live, live_imgs, checks, cvec_cached, mtp.kv_state(), delta_base)) continue;
                 } else {
                     strata::core::SavedConversation image;
                     size_t bytes = 0;
