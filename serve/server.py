@@ -362,7 +362,7 @@ class MockEngine:
         self.cycle = bool(cycle)
         self.last_prompt: list[int] = []
 
-    def generate(self, ids, max_new, sampling, cancel, embeddings=None, keep_slot=False):
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None, keep_slot=False, turn_hook=None):
         self.last_prompt = list(ids)
         self.last_embeddings = embeddings
         if len(self.scripts) > 1:
@@ -1802,7 +1802,7 @@ class StrataEngine:
         with self.slot_cv:
             return any(e[0] * 2 <= plen for e in self.wait_lens)
 
-    def generate_batched(self, ids, max_new, sampling, cancel, embeddings=None, keep_slot=False):
+    def generate_batched(self, ids, max_new, sampling, cancel, embeddings=None, keep_slot=False, turn_hook=None):
         """--batch.  Alone (no slot busy, nobody waiting): the solo path (GEN, with drafts: the fastest stream)
         - and when another request arrives meanwhile, this one is STOPped and continues in a batch slot (BGEN with
         its prompt + what it generated: the engine reuses that prefix).  Otherwise: BGEN into a free slot, then the
@@ -2087,6 +2087,13 @@ class StrataEngine:
                         if f[3:4] == ["nonfinite"]:              # #879: the engine dropped the slot's state
                             self.slot_held[slot] = []
                             raise EngineNonFinite("the engine's logits became non-finite (#879)")
+                        # a turn that finished (not one the solo path takes back) is handed to its owner while the slot
+                        # is still its own: the K/V and the tokens are there, nothing else is admitted into the slot
+                        if turn_hook is not None and f[3:4] != ["cancel"]:
+                            try:
+                                turn_hook(slot, list(self.slot_held[slot]))
+                            except Exception as error:      # the turn's own answer is not lost to its save
+                                print(f"strata serve: turn hook failed: {error}", file=sys.stderr, flush=True)
                         if (going_solo and f[3:4] == ["cancel"] and not cancel.is_set() and len(out) < int(max_new)
                                 and not (out and out[-1] in EOS_IDS)):
                             # the solo path continues it: the engine copies the slot's sessions back (all but the
@@ -2228,7 +2235,7 @@ class StrataEngine:
                          "tok_s": round(r["generated"] / max(1e-6, now - ft), 1) if ft else None})
         return view
 
-    def generate(self, ids, max_new, sampling, cancel, embeddings=None, prefill_only=False, keep_slot=False):
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None, prefill_only=False, keep_slot=False, turn_hook=None):
         """Yields token ids, and None as a heartbeat every 10 s while the engine is quiet (reading a long prompt):
         the HTTP layer turns it into an SSE comment, which keeps clients' watchdogs calm and notices a client that
         has gone.  A consumer that stops early (or `cancel`) makes the engine STOP, so it does not run to max_new."""
@@ -2236,7 +2243,8 @@ class StrataEngine:
             raise EngineDied("the engine is unavailable; this request was not sent")
         bias_api.validate_request(sampling or {}, self, None)
         if getattr(self, "batch", 0):
-            yield from self.generate_batched(ids, max_new, sampling, cancel, embeddings, keep_slot=keep_slot)
+            yield from self.generate_batched(ids, max_new, sampling, cancel, embeddings, keep_slot=keep_slot,
+                                             turn_hook=turn_hook)
             return
         self.progress, self.progress_ms, self.reused = None, 0, 0
         self.prefill_tok_s_mean = None
@@ -2430,7 +2438,8 @@ class StrataEngine:
             pass
         return EngineSilent(f"{what}; the server ended the engine")
 
-    def session_file(self, action: str, path: str, slot: int | None = None, ids: list[int] | None = None) -> dict:
+    def session_file(self, action: str, path: str, slot: int | None = None, ids: list[int] | None = None,
+                     in_turn: bool = False) -> dict:
         """A disk session (see `_session_round`).  `slot`: one batch slot's session, `SAVE @<slot>` / `RESTORE @<slot>`.
         It needs every slot idle (the engine runs nothing else meanwhile), and the slot is busy while it moves.  A save
         returns the tokens the slot holds (`ids`); a restore sets them, as the slot's held tokens for the next turn
@@ -2441,9 +2450,11 @@ class StrataEngine:
             raise ValueError(f"no batch slot {slot}")
         if action.startswith("restore") and ids is None:
             raise ValueError("a slot restore needs the tokens the session holds")
+        # in_turn: the slot is the caller's own turn (its window is still open); the others must be idle
         with self.slot_cv:
-            if any(self.slot_busy):
+            if any(b for x, b in enumerate(self.slot_busy) if x != slot) or (not in_turn and self.slot_busy[slot]):
                 raise SessionRefused("busy", "a batch slot is busy: the session waits until every slot is idle")
+            was_busy = self.slot_busy[slot]
             self.slot_busy[slot] = True
         try:
             try:
@@ -2460,7 +2471,7 @@ class StrataEngine:
             return result
         finally:
             with self.slot_cv:
-                self.slot_busy[slot] = False
+                self.slot_busy[slot] = was_busy
                 self.slot_cv.notify_all()
 
     def _session_round(self, action: str, path: str, slot: int | None) -> dict:
@@ -5264,22 +5275,24 @@ class Service:
         return now
 
     def run(self, ids, thinking, tools, max_new, sampling, cancel, force=None,
-            declared_only=False, keep_slot=False) -> Iterator[tuple[str, object]]:
+            declared_only=False, keep_slot=False, turn_hook=None) -> Iterator[tuple[str, object]]:
         """The request's events (see _run); with "prevent_sleep" in the config, the PC stays awake while it runs or waits."""
         ka = self.keep_awake
         if ka is not None:
             ka.acquire()
         try:
-            yield from self._run(ids, thinking, tools, max_new, sampling, cancel, force, declared_only, keep_slot=keep_slot)
+            yield from self._run(ids, thinking, tools, max_new, sampling, cancel, force, declared_only, keep_slot=keep_slot,
+                                 turn_hook=turn_hook)
         finally:
             if ka is not None:
                 ka.release()
 
     def _run(self, ids, thinking, tools, max_new, sampling, cancel, force=None,
-             declared_only=False, keep_slot=False) -> Iterator[tuple[str, object]]:
+             declared_only=False, keep_slot=False, turn_hook=None) -> Iterator[tuple[str, object]]:
         """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..}).
         `force` (forced_call): the opening of the call the reply must make - see prepare().
-        `keep_slot` (--batch): the turn stays in a batch slot, where a session can save it (no solo path)."""
+        `keep_slot` (--batch): the turn stays in a batch slot, where a session can save it (no solo path).
+        `turn_hook(slot, held)`: called in the turn's slot window at its end, while the slot still holds the turn."""
         # the model card's sampling for this thinking state, then the config's block, then the Chat settings shared with
         # apps; the request's own fields win over all of them
         defaults = {**model_card_sampling(self.model_arch, thinking), **self.sampling_defaults, **self.shared}
@@ -5460,7 +5473,7 @@ class Service:
                     while True:
                         segment_before = getattr(self.engine, "last", None)
                         segments_before = len(segments)     # (#879: a pass sent again leaves no segment)
-                        slot_kw = {"keep_slot": True} if keep_slot else {}
+                        slot_kw = {"keep_slot": True, "turn_hook": turn_hook} if keep_slot else {}
                         gen = self.engine.generate(prompt, max_new - n, sampling, cancel, embeddings=emb, **slot_kw) if emb \
                             else self.engine.generate(prompt, max_new - n, sampling, cancel, **slot_kw)
                         recover_prompt = None
