@@ -12480,6 +12480,9 @@ int main(int argc, char** argv) {
         }
         strata::core::pin_sim_report("at READY");
         strata::core::pin_reserve_release_hard();   // the load is over: nothing else needs the headroom
+        // the batch slots as they are at READY (the INFO line above is printed before the batch is fitted): the
+        // bridge reads them to decide whether a turn can be saved in a slot (INFO batch_slots=N)
+        std::printf("INFO batch_slots=%d\n", o.batch);
         std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
         std::fflush(stdout);
         std::string line;
