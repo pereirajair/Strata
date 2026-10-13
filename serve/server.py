@@ -1626,9 +1626,11 @@ class StrataEngine:
                 return line
         return None
 
-    def _await_bdone(self, slot: int) -> bool:
-        """Reads a slot's lines until its BDONE (its turn is over in the engine). True when it came."""
+    def _await_bdone(self, slot: int, tail: list[int]):
+        """Reads a slot's lines until its BDONE (its turn is over in the engine): (finish, the tokens the slot fed, with
+        the BT lines still to come) or None when it does not come."""
         q = self.slot_q[slot]
+        tail = list(tail)
         end = time.monotonic() + 60.0
         while time.monotonic() < end:
             try:
@@ -1636,10 +1638,16 @@ class StrataEngine:
             except queue.Empty:
                 continue
             if line is None:
-                return False
+                return None
+            if line.startswith("BT "):
+                try:
+                    tail.append(int(line.split()[2]))
+                except (IndexError, ValueError):
+                    return None
             if line.startswith("BDONE "):
-                return True
-        return False
+                f = line.split()
+                return (f[3] if len(f) > 3 else "", tail)
+        return None
 
     def _release_slot_when_done(self, slot: int, stream: list[int] | None = None):
         """A slot whose consumer left (a stop token, a stop string, a disconnect): BSTOP it and free it once the engine
@@ -2170,9 +2178,10 @@ class StrataEngine:
                 self.slot_live[slot] = None
                 self.slot_used[slot] = time.time()
                 if phase == "slot" and bdone_in:
+                    # the turn ended on its EOS and its BDONE came with it (read above): handed to its owner while the
+                    # slot still holds it, as the BDONE wait below does
                     stream = list(prompt) + out[gen0:] if gen0 is not None and len(out) > gen0 else None
                     self.slot_held[slot] = stream[:-1] if stream else []     # as the BDONE wait leaves it
-                    # the turn ended on its EOS and its BDONE is here: handed to its owner while the slot still holds it
                     if turn_hook is not None and bd_finish in ("stop", "length"):
                         try:
                             turn_hook(slot, list(self.slot_held[slot]))
@@ -2182,29 +2191,35 @@ class StrataEngine:
                         self.slot_busy[slot] = False
                         self.slot_claims.discard(slot)
                         self.slot_cv.notify_all()
-                elif (phase == "slot" and turn_hook is not None and gen0 is not None and bool(out)
-                      and (out[-1] in EOS_IDS or len(out) >= int(max_new)) and self._await_bdone(slot)):
-                    # a turn that ended on its length (or whose EOS BDONE came late): the engine's BDONE is waited for
-                    held_now = list(prompt) + out[gen0:-1]
-                    self.slot_held[slot] = held_now
-                    try:
-                        turn_hook(slot, list(held_now))
-                    except Exception as error:
-                        print(f"strata serve: turn hook failed: {error}", file=sys.stderr, flush=True)
-                    with self.slot_cv:
-                        self.slot_busy[slot] = False
-                        self.slot_claims.discard(slot)
-                        self.slot_cv.notify_all()
-                elif phase == "slot":
-                    self.slot_held[slot] = []
-                    stream = list(prompt) + out[gen0:] if gen0 is not None and len(out) > gen0 else None
-                    self._release_slot_when_done(slot, stream)    # freed at its BDONE
-                    self.slot_claims.discard(slot)                # (the BDONE wait owns it now)
                 else:
-                    with self.slot_cv:
-                        self.slot_busy[slot] = False
-                        self.slot_claims.discard(slot)
-                        self.slot_cv.notify_all()
+                    # a turn that ended on its own token (the consumer stopped at the EOS, or the length) is handed to its
+                    # owner in the same way as at BDONE: the engine's BDONE comes at once, the slot holds the turn until then
+                    # the engine says how the turn ended (BDONE's finish): stop or length hands the turn to its owner
+                    ended = (self._await_bdone(slot, list(prompt) + out[gen0:])
+                             if phase == "slot" and turn_hook is not None and gen0 is not None and not cancel.is_set()
+                             else None)
+                    if ended is not None:
+                        fin, tokens = ended
+                        self.slot_held[slot] = list(tokens[:-1]) if tokens else []
+                        if fin in ("stop", "length"):
+                            try:
+                                turn_hook(slot, list(self.slot_held[slot]))
+                            except Exception as error:
+                                print(f"strata serve: turn hook failed: {error}", file=sys.stderr, flush=True)
+                        with self.slot_cv:
+                            self.slot_busy[slot] = False
+                            self.slot_claims.discard(slot)
+                            self.slot_cv.notify_all()
+                    elif phase == "slot":
+                        self.slot_held[slot] = []
+                        stream = list(prompt) + out[gen0:] if gen0 is not None and len(out) > gen0 else None
+                        self._release_slot_when_done(slot, stream)    # freed at its BDONE
+                        self.slot_claims.discard(slot)                # (the BDONE wait owns it now)
+                    else:
+                        with self.slot_cv:
+                            self.slot_busy[slot] = False
+                            self.slot_claims.discard(slot)
+                            self.slot_cv.notify_all()
 
     slot_groups = 1         # --batch-groups (set when the engine starts)
     SLOT_PREFIX_MIN = 512   # a held prefix shorter than this is not worth unbalancing the pipeline's groups
