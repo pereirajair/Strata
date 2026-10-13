@@ -6000,10 +6000,15 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: layer split, CUDA%d: the session state failed\n", st.dev);
             return 1;
         }
+        // The head belongs to the last GPU of the process that holds the model's last layer. An earlier stage in its
+        // own process (a layer split across its GPUs) has no output.weight, and needs none (see verify.cpp: "an
+        // earlier stage in its own process has no head").
         const bool last = i + 1 == stages.size();
+        const bool head_here = last && (!stage_mode || o.stage_hi >= kStageLayers);
         const strata::core::WeightRef* wo_s = st.wt.find("output.weight");
-        if (wo_s == nullptr ||
-            (last && !o.native_head_gguf.empty() && !st.head.load(o.native_head_shards, g.n_embd, wo_s->ne1, err))) {
+        if (head_here &&
+            (wo_s == nullptr ||
+             (!o.native_head_gguf.empty() && !st.head.load(o.native_head_shards, g.n_embd, wo_s->ne1, err)))) {
             std::fprintf(stderr, "strata generate: layer split, CUDA%d head: %s%s\n", st.dev,
                          wo_s == nullptr ? "output.weight is missing" : err.c_str(),
                          wo_s == nullptr ? "" : vram_free_note().c_str());
