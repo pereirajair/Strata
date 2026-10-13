@@ -10307,6 +10307,8 @@ int main(int argc, char** argv) {
         } delta_base;
         std::optional<strata::core::SavedConversation> delta_image;
         std::vector<DeltaBase> slot_delta_base((size_t) std::max(o.batch, 0));   // the same, per batch slot
+        // the full image a slot restored last, which the next RESTORE_DELTA @slot applies to
+        std::vector<std::optional<strata::core::SavedConversation>> slot_delta_image((size_t) std::max(o.batch, 0));
         int64_t tail_ckpt_len = -1;   // --prompt-cache-tail: the length of the one tail checkpoint alive (-1 = none)
         // --prefill-pipe: the plan of the prompt segment being read (read_part sets it around its runs), for the
         // checkpoints taken inside it
@@ -13655,6 +13657,83 @@ int main(int argc, char** argv) {
                 } else if (save) {
                     if (!live_ok || live.empty()) { refuse("no complete session to save"); continue; }
                     if (!save_session(ss, live, live_imgs, checks, cvec_cached, mtp.kv_state(), delta_base)) continue;
+                } else if (slot >= 0) {
+                    // RESTORE [DELTA] @<slot> <path>: the conversation into an idle batch slot, its K/V and state
+                    if (bslot_ss.empty() || slot >= (int) bs.size() || bs[(size_t) slot].active) {
+                        refuse("no idle batch slot to restore into");
+                        continue;
+                    }
+                    strata::core::SavedConversation image;
+                    size_t bytes = 0;
+                    bool ok_read = false;
+                    try {
+                        strata::core::SessionReadLimits limits;
+                        limits.progress = moving;
+                        const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
+                        limits.admit = [floor, &o](uint64_t need, std::string& why) {
+                            const auto avail = strata::core::available_host_bytes();
+                            if (strata::core::conversation_memory_admit(avail, need, floor)) return true;
+                            why = "not enough RAM to read it (" + std::to_string(need >> 20) + " MiB plus a floor of " +
+                                  std::to_string((long long) o.conversation_cache_min_free_mib) + " MiB needed, " +
+                                  (avail ? std::to_string(*avail >> 20) + " MiB available)" : "RAM telemetry unavailable)");
+                            return false;
+                        };
+                        if (!strata::core::conversation_session_read_limits(
+                                limits, *bslot_ss[0][(size_t) slot], g, mtp.kv_state(), (uint64_t) o.max_context,
+                                (uint64_t) std::max(o.prompt_cache, 1), err)) {
+                            refuse(err, strata::core::SessionError::io);
+                            continue;
+                        }
+                        strata::core::SessionStatus st;
+                        auto& base_image = slot_delta_image[(size_t) slot];
+                        if (delta) {
+                            strata::core::SessionDelta d;
+                            if (!base_image) { refuse("no base image in this slot to apply the delta to"); continue; }
+                            if (!strata::core::session_delta_read(path, id, d, bytes, err, limits, &st)) {
+                                refuse(err, st.error);
+                                continue;
+                            }
+                            if (!strata::core::session_delta_apply(*base_image, d, err)) {
+                                refuse(err, strata::core::SessionError::invalid);
+                                continue;
+                            }
+                            image = std::move(*base_image);
+                            base_image.reset();
+                        } else if (!strata::core::session_file_read(path, id, image, bytes, err, limits, &st)) {
+                            refuse(err, st.error);
+                            continue;
+                        }
+                        ok_read = true;
+                    } catch (const std::bad_alloc&) {
+                        refuse("not enough RAM to read the session", strata::core::SessionError::memory);
+                        continue;
+                    }
+                    if (!ok_read) continue;
+                    // host -> device into the slot's own state; a failure after the device was touched ends the engine
+                    blocking("transfer", bytes);
+                    if (strata::core::conversation_snapshot_restore(image, *bslot_ss[0][(size_t) slot], g, mtp.kv_state(),
+                                                                    err) != strata::core::ConversationRestore::restored) {
+                        std::printf("FATAL restoring the session file failed after the device state was changed: %s\n",
+                                    err.c_str());
+                        std::fflush(stdout);
+                        return 1;
+                    }
+                    BSlot& target = bs[(size_t) slot];
+                    target.ids = image.live.ids;
+                    target.img = false;
+                    target.cvec = image.cvec;
+                    target.checks = std::move(image.checkpoints);
+                    target.cached = true;
+                    target.partial = false;
+                    target.stop = false;
+                    for (const ConvCheckpoint& c : target.checks) check_clock = std::max(check_clock, c.used);
+                    // the slot's full image is the base its next delta applies to
+                    image.live.ids = target.ids;
+                    image.checkpoints.clear();
+                    slot_delta_image[(size_t) slot] = std::move(image);
+                    std::fprintf(stderr, "strata serve: batch slot %d restored %zu tokens, %zu bytes\n", slot,
+                                 target.ids.size(), bytes);
+                    std::printf("RESTORED %zu %zu %.1f\n", target.ids.size(), bytes, ms());
                 } else {
                     strata::core::SavedConversation image;
                     size_t bytes = 0;
