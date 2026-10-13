@@ -93,12 +93,17 @@ SavedConversation sample() {
 }
 
 // format v1 golden: the file the fixed sample() gives (size and session_hash64 of all bytes, seed 0)
-constexpr size_t kGoldenSize = 17878543;
-constexpr uint64_t kGoldenHash = 0x4609d78897349d5bull;
+constexpr size_t kGoldenSize = 17878567;
+constexpr uint64_t kGoldenHash = 0x07c4f14286ac0da2ull;
 
 bool same_checkpoint(const ConversationCheckpoint& a, const ConversationCheckpoint& b) {
-    return a.ids == b.ids && a.imgs == b.imgs && a.gdn == b.gdn && a.ple == b.ple && a.tails == b.tails &&
-           a.dead == b.dead && a.block_pos == b.block_pos && a.used == b.used && b.stage_parts.empty();
+    if (!(a.ids == b.ids && a.imgs == b.imgs && a.gdn == b.gdn && a.ple == b.ple && a.tails == b.tails &&
+          a.dead == b.dead && a.block_pos == b.block_pos && a.used == b.used &&
+          a.stage_parts.size() == b.stage_parts.size()))
+        return false;
+    for (size_t i = 0; i < a.stage_parts.size(); ++i)
+        if (!same_checkpoint(a.stage_parts[i], b.stage_parts[i])) return false;
+    return true;
 }
 
 bool same(const SavedConversation& a, const SavedConversation& b) {
@@ -309,6 +314,31 @@ int main() {
         check(!session_delta_write((dir / "delta.bin").string(), staged, none, {}, {}, 0, id, dbytes, error),
               "a delta with stage images is refused");
         check(error.find("delta") != std::string::npos, "the refusal says why");
+    }
+    // a layer split's running state: one part per later stage (the live state and each checkpoint), written with the
+    // stages' images and read back identical; a part without its stage image is refused (an incomplete layout)
+    {
+        SavedConversation split2 = sample();
+        SavedConversation later = sample();
+        later.geometry[0] = 778;
+        later.layer_lo = 33; later.layer_hi = 48;
+        split2.stage_images.push_back(later);
+        split2.live.stage_parts.push_back(checkpoint(2, 9));
+        for (auto& c : split2.checkpoints) c.stage_parts.push_back(checkpoint(3, 9));
+        const fs::path p = dir / "parts.bin";
+        check(session_file_write(p.string(), split2, id, written, error), "a complete layer-split state is written");
+        SavedConversation back;
+        size_t read = 0;
+        check(session_file_read(p.string(), id, back, read, error), "a complete layer-split state reads back");
+        check(same(back, split2), "the layer-split state is identical, parts and stages included");
+        SavedConversation limited;
+        SessionReadLimits lim;
+        lim.max_stages = 0;
+        check(!session_file_read(p.string(), id, limited, read, error, lim), "a part count over the limit is refused");
+        SavedConversation incomplete = split2;
+        incomplete.stage_images.clear();
+        check(!session_file_write((dir / "incomplete.bin").string(), incomplete, id, written, error),
+              "parts without the stages' images are refused");
     }
     // a write into a missing directory fails cleanly
     check(!session_file_write((dir / "nope" / "x.bin").string(), original, id, written, error),
