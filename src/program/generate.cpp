@@ -10298,6 +10298,14 @@ int main(int argc, char** argv) {
         // checkpoint frees nothing at the next prune, so every save would fault in fresh pages (17 -> 40-60 ms)
         CheckpointPool ckpt_pool(ckpt_pool_env() || slot_ckpt_move_env(), ckpt_pool_cap_env());
         uint64_t check_clock = 0;   // the checkpoints' LRU clock; creation and every use advance it
+        // Turn deltas (SAVE_DELTA / RESTORE_DELTA): the base the other side holds, as this machine last left it (ids and
+        // the K/V extents per layer), and on the receiving side the full image that base became.
+        struct DeltaBase {
+            bool valid = false;
+            std::vector<int32_t> ids;
+            std::vector<int64_t> cells, pooled;
+        } delta_base;
+        std::optional<strata::core::SavedConversation> delta_image;
         int64_t tail_ckpt_len = -1;   // --prompt-cache-tail: the length of the one tail checkpoint alive (-1 = none)
         // --prefill-pipe: the plan of the prompt segment being read (read_part sets it around its runs), for the
         // checkpoints taken inside it
@@ -13440,9 +13448,11 @@ int main(int argc, char** argv) {
             // (fingerprint file, state capture, file flush, rename + folder flush, validation, device transfer):
             // that step is allowed <seconds> (session_phase_limit_s) by the watchdog and by the server, no more.
             // (A verifier commit that fails before the command still answers ERR and exits, as for a request.)
-            if (line.rfind("SAVE ", 0) == 0 || line.rfind("RESTORE ", 0) == 0) {
+            const bool delta_cmd = line.rfind("SAVE_DELTA ", 0) == 0 || line.rfind("RESTORE_DELTA ", 0) == 0;
+            if (line.rfind("SAVE ", 0) == 0 || line.rfind("RESTORE ", 0) == 0 || delta_cmd) {
                 const bool save = line[0] == 'S';
-                const std::string path = line.substr(save ? 5 : 8);
+                const bool delta = delta_cmd;
+                const std::string path = line.substr(save ? (delta ? 11 : 5) : (delta ? 14 : 8));
                 const auto t0 = Clock::now();
                 auto ms = [&] { return std::chrono::duration<double, std::milli>(Clock::now() - t0).count(); };
                 auto refuse = [&](const std::string& why, strata::core::SessionError kind = strata::core::SessionError::invalid,
@@ -13570,9 +13580,42 @@ int main(int argc, char** argv) {
                         wo.progress = moving;
                         wo.phase = blocking;
                         strata::core::SessionStatus st;
-                        if (!strata::core::session_file_write(path, meta, sources, id, bytes, err, wo, &st)) {
+                        if (delta) {
+                            // a delta is cut from the base the other side holds: that base must still be a prefix of the
+                            // live conversation (a rewind or a new branch is a whole session), and the K/V layers must be
+                            // the same ones
+                            if (!delta_base.valid) { refuse("no base to cut a delta from: save the whole session first"); continue; }
+                            if (live.size() < delta_base.ids.size() ||
+                                !std::equal(delta_base.ids.begin(), delta_base.ids.end(), live.begin())) {
+                                refuse("the base is not a prefix of the live conversation: save the whole session");
+                                continue;
+                            }
+                            if (sources.size() != delta_base.cells.size()) {
+                                refuse("the K/V layers changed since the base: save the whole session");
+                                continue;
+                            }
+                            std::vector<int64_t> base_cells = delta_base.cells, base_pooled = delta_base.pooled;
+                            std::vector<strata::core::SessionKvSource> tails;
+                            for (size_t i = 0; i < sources.size(); ++i)
+                                tails.push_back(strata::core::session_delta_tail_source(sources[i], base_cells[i], base_pooled[i]));
+                            const uint64_t fp = strata::core::session_base_fingerprint(delta_base.ids, base_cells, base_pooled);
+                            if (!strata::core::session_delta_write(path, meta, tails, base_cells, base_pooled, fp, id, bytes,
+                                                                   err, wo, &st)) {
+                                refuse(err, st.error, st.published);
+                                continue;
+                            }
+                        } else if (!strata::core::session_file_write(path, meta, sources, id, bytes, err, wo, &st)) {
                             refuse(err, st.error, st.published);
                             continue;
+                        }
+                        // the other side holds this session now: the next delta is cut from it
+                        delta_base.valid = true;
+                        delta_base.ids = live;
+                        delta_base.cells.clear();
+                        delta_base.pooled.clear();
+                        for (const auto& src : sources) {
+                            delta_base.cells.push_back(src.cells);
+                            delta_base.pooled.push_back(src.pooled_rows);
                         }
                         if (st.dir_flush_unsupported)
                             std::fprintf(stderr, "strata serve: session saved to %s; this filesystem cannot flush a "
@@ -13611,7 +13654,22 @@ int main(int argc, char** argv) {
                             continue;
                         }
                         strata::core::SessionStatus st;
-                        if (!strata::core::session_file_read(path, id, image, bytes, err, limits, &st)) {
+                        if (delta) {
+                            // the delta applies to the base image this machine holds: the base is kept whole, and a
+                            // refused delta leaves it as it was
+                            strata::core::SessionDelta d;
+                            if (!delta_image) { refuse("no base image to apply the delta to: restore the whole session first"); continue; }
+                            if (!strata::core::session_delta_read(path, id, d, bytes, err, limits, &st)) {
+                                refuse(err, st.error);
+                                continue;
+                            }
+                            if (!strata::core::session_delta_apply(*delta_image, d, err)) {
+                                refuse(err, strata::core::SessionError::invalid);
+                                continue;
+                            }
+                            image = std::move(*delta_image);
+                            delta_image.reset();
+                        } else if (!strata::core::session_file_read(path, id, image, bytes, err, limits, &st)) {
                             refuse(err, st.error);
                             continue;
                         }
@@ -13659,6 +13717,11 @@ int main(int argc, char** argv) {
                                              "replaces the live one; dropped %zu parked conversation%s\n", n_parked,
                                      n_parked == 1 ? "" : "s");
                     }
+                    // the image is the base the next delta applies to: the live conversation it holds is the one just
+                    // restored, and its K/V stays whole
+                    image.live.ids = live;
+                    image.checkpoints.clear();
+                    delta_image = std::move(image);
                     std::fprintf(stderr, "strata serve: session restored %zu tokens, %zu checkpoints, %zu bytes from %s "
                                  "in %.1f ms (read+check %.1f ms)\n", live.size(), checks.size(), bytes, path.c_str(),
                                  ms(), read_ms);
