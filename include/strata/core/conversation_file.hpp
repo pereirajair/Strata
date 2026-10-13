@@ -8,6 +8,7 @@
 #pragma once
 
 #include "strata/core/conversation_cache.hpp"
+#include "strata/core/conversation_delta.hpp"
 
 #include <array>
 #include <cstddef>
@@ -239,5 +240,40 @@ bool session_file_read(const std::string& path, const SessionFileIdentity& id, S
 // be tested anywhere).  Windows: backslashes and a trailing backslash, as GetDiskFreeSpaceExW requires for a UNC
 // folder (\\server\share\dir\) and gives a drive root (C:\); empty for a bare file name (the current folder).
 std::string session_free_space_dir(const std::string& path, bool windows_rules);
+
+
+// ---- Turn deltas (a separate file kind, magic STRSDLT): what a turn added to a session, against the base image the
+// receiver already holds. The file carries the geometry, the layer carve, the live checkpoint (its recurrent state
+// whole), the checkpoints, and per K/V layer only the cells and index rows after the base extent (`KvDelta`).
+// A delta applies only to the base it was cut from: `session_base_fingerprint` must match, or it is refused.
+
+// Identifies a base: its live token ids and the extent of each K/V layer (main layers, then the draft layer).
+uint64_t session_base_fingerprint(const std::vector<int32_t>& live_ids, const std::vector<int64_t>& cells,
+                                  const std::vector<int64_t>& pooled_rows);
+
+struct SessionDelta {
+    uint64_t base_fingerprint = 0;
+    std::vector<int64_t> base_cells, base_pooled;  // per K/V layer: the extent the tail starts at
+    SavedConversation meta;                        // everything but the K/V (meta.kv stays empty)
+    std::vector<KvDelta> tails;                    // per K/V layer, the tail after its base extent
+};
+
+// The tail of one K/V layer as a source: the bytes after the base extent, read through the full layer's source.
+SessionKvSource session_delta_tail_source(const SessionKvSource& full, int64_t base_cells, int64_t base_pooled);
+
+// Writes the delta. `tails` are tail sources (see session_delta_tail_source), one per K/V layer.
+bool session_delta_write(const std::string& path, const SavedConversation& meta,
+                         const std::vector<SessionKvSource>& tails, const std::vector<int64_t>& base_cells,
+                         const std::vector<int64_t>& base_pooled, uint64_t base_fingerprint,
+                         const SessionFileIdentity& id, size_t& bytes, std::string& error,
+                         const SessionWriteOptions& opt = {}, SessionStatus* status = nullptr);
+
+bool session_delta_read(const std::string& path, const SessionFileIdentity& id, SessionDelta& delta, size_t& bytes,
+                        std::string& error, const SessionReadLimits& limits = {}, SessionStatus* status = nullptr);
+
+// Applies a delta to the base image it was cut from: the base's live ids and extents must match the fingerprint,
+// and the geometry and layer carve must agree. On any refusal the base is left as it was.
+bool session_delta_apply(SavedConversation& base, const SessionDelta& delta, std::string& error);
+
 
 } // namespace strata::core
