@@ -9342,10 +9342,14 @@ int main(int argc, char** argv) {
                 };
                 strata::core::progress_at(save ? "saving a session" : "restoring a session");
                 if (path.empty()) { refuse("missing path"); continue; }
-                if (!stages.empty() || multi_gpu) { refuse("session files do not support --layer-split"); continue; }
+                // a layer split's session is saved and restored from a batch slot (one image per GPU); the whole-model
+                // commands do not run on a split: the slots hold the conversations then
+                const bool split_slot = slot >= 0 && (!stages.empty() || multi_gpu);
+                if (split_slot && multi_gpu && stages.empty()) { refuse("session files do not support this layer split"); continue; }
+                if (!split_slot && (!stages.empty() || multi_gpu)) { refuse("session files do not support --layer-split"); continue; }
                 if (stage_mode) { refuse("session files do not support a stage per process"); continue; }
                 if (o.peer_device >= 1) { refuse("session files do not support --peer-device"); continue; }
-                if (o.batch > 0) { refuse("session files do not support --batch (parallel requests)"); continue; }
+                if (slot < 0 && o.batch > 0) { refuse("session files do not support --batch (parallel requests)"); continue; }
                 if (o.prompt_cache <= 0) { refuse("session files need --prompt-cache > 0"); continue; }
                 if (!ver.wait_commit(err)) {
                     std::printf("ERR %s\n", err.c_str());
@@ -9477,7 +9481,57 @@ int main(int argc, char** argv) {
                     std::printf("SAVED %zu %zu %.1f\n", live.size(), bytes, ms());
                         return true;
                     };
-                if (save && slot >= 0) {
+                // the draft of a split's last stage: the MTP drafter's state (none without MTP)
+                auto split_draft = [&](size_t j) -> const strata::core::QsaState* {
+                    return use_mtp && j == stages.size() ? &mtp.kv_state() : nullptr;
+                };
+                // a layer split's whole session in slot `b`: the first GPU's image, then each later stage's, the checkpoints
+                // split on a copy (the slot keeps its own).  The layout the parked conversations use.
+                auto slot_image = [&](int b, strata::core::SavedConversation& image, std::string& e) -> bool {
+                    BSlot& sl = bs[(size_t) b];
+                    const size_t n_st = stages.size();
+                    std::vector<ConvCheckpoint> copy = sl.checks;
+                    auto cs = strata::core::conversation_checkpoints_split(std::move(copy), n_st);
+                    const strata::core::ConversationView v0{sl.ids, std::vector<ImgKey>{}, cs.stage0, true};
+                    if (!strata::core::conversation_snapshot_save(image, v0, *bslot_ss[0][(size_t) b], g, split_draft(0), e))
+                        return false;
+                    for (size_t k = 0; k < n_st; ++k) {
+                        const strata::core::OnDevice on(stages[k]->dev);
+                        if (cudaDeviceSynchronize() != cudaSuccess) { e = "stage sync failed"; return false; }
+                        const strata::core::ConversationView vk{sl.ids, std::vector<ImgKey>{}, cs.parts[k], true};
+                        strata::core::SavedConversation part;
+                        if (!strata::core::conversation_snapshot_save(part, vk, *bslot_ss[k + 1][(size_t) b], g,
+                                                                      split_draft(k + 1), e))
+                            return false;
+                        image.stage_images.push_back(std::move(part));
+                    }
+                    return true;
+                };
+                if (save && split_slot) {
+                    if (bslot_ss.empty() || slot >= (int) bs.size() || bs[(size_t) slot].active ||
+                        bs[(size_t) slot].ids.empty() || bs[(size_t) slot].img) {
+                        refuse("no idle batch slot with a conversation to save");
+                        continue;
+                    }
+                    if (delta) { refuse("a layer split's session is saved whole, not as a delta"); continue; }
+                    strata::core::SavedConversation image;
+                    std::string e;
+                    if (!slot_image(slot, image, e)) { refuse(e, strata::core::SessionError::memory); continue; }
+                    strata::core::SessionWriteOptions wo;
+                    wo.min_free_bytes = (uint64_t) o.session_min_free_mib << 20;
+                    wo.progress = moving;
+                    wo.phase = blocking;
+                    strata::core::SessionStatus st;
+                    size_t bytes = 0;
+                    if (!strata::core::session_file_write(path, image, id, bytes, err, wo, &st)) {
+                        refuse(err, st.error, st.published);
+                        continue;
+                    }
+                    slot_delta_base[(size_t) slot] = {};   // deltas are not cut from a split: the next save is whole
+                    std::fprintf(stderr, "strata serve: layer-split session of slot %d saved: %zu tokens, %zu stages, %zu bytes to %s\n",
+                                 slot, bs[(size_t) slot].ids.size(), stages.size() + 1, bytes, path.c_str());
+                    std::printf("SAVED %zu %zu %.1f\n", bs[(size_t) slot].ids.size(), bytes, ms());
+                } else if (save && slot >= 0) {
                     if (bslot_ss.empty() || slot >= (int) bs.size() || bs[(size_t) slot].active ||
                         bs[(size_t) slot].ids.empty() || bs[(size_t) slot].img) {
                         refuse("no idle batch slot with a conversation to save");
@@ -9541,6 +9595,61 @@ int main(int argc, char** argv) {
                         continue;
                     }
                     if (!ok_read) continue;
+                    if (split_slot || !image.stage_images.empty()) {
+                        // a layer split: the file's topology must be this engine's (a conversion between topologies is not
+                        // done here); every image is validated before any device state changes
+                        if (image.stage_images.size() != stages.size()) {
+                            refuse("the session file is another layer split (a conversion between topologies is not done yet)");
+                            continue;
+                        }
+                        std::vector<strata::core::SavedConversation> later = std::move(image.stage_images);
+                        image.stage_images.clear();
+                        std::string e;
+                        bool valid = strata::core::conversation_snapshot_validate(image, *bslot_ss[0][(size_t) slot], g,
+                                                                                  split_draft(0), e);
+                        for (size_t k = 0; valid && k < later.size(); ++k) {
+                            const strata::core::OnDevice on(stages[k]->dev);
+                            valid = strata::core::conversation_snapshot_validate(later[k], *bslot_ss[k + 1][(size_t) slot], g,
+                                                                                 split_draft(k + 1), e);
+                        }
+                        if (!valid) { refuse(e, strata::core::SessionError::invalid); continue; }
+                        blocking("transfer", bytes);
+                        if (strata::core::conversation_snapshot_restore(image, *bslot_ss[0][(size_t) slot], g, split_draft(0),
+                                                                        e) != strata::core::ConversationRestore::restored) {
+                            std::printf("FATAL restoring the session file failed after the device state was changed: %s\n", e.c_str());
+                            std::fflush(stdout);
+                            return 1;
+                        }
+                        for (size_t k = 0; k < later.size(); ++k) {
+                            const strata::core::OnDevice on(stages[k]->dev);
+                            if (strata::core::conversation_snapshot_restore(later[k], *bslot_ss[k + 1][(size_t) slot], g,
+                                                                            split_draft(k + 1), e) !=
+                                strata::core::ConversationRestore::restored) {
+                                std::printf("FATAL restoring the session file failed after the device state was changed: %s\n", e.c_str());
+                                std::fflush(stdout);
+                                return 1;
+                            }
+                        }
+                        // the checkpoints come back with their stage parts (the same join the parked conversations use)
+                        strata::core::ConversationCheckpointSplit cs;
+                        cs.stage0 = std::move(image.checkpoints);
+                        for (auto& p : later) cs.parts.push_back(std::move(p.checkpoints));
+                        BSlot& target = bs[(size_t) slot];
+                        if (!strata::core::conversation_checkpoints_merge(std::move(cs), target.checks)) target.checks.clear();
+                        target.ids = image.live.ids;
+                        target.img = false;
+                        target.cvec = image.cvec;
+                        target.cached = true;
+                        target.partial = false;
+                        target.stop = false;
+                        for (const ConvCheckpoint& c : target.checks) check_clock = std::max(check_clock, c.used);
+                        slot_delta_base[(size_t) slot] = {};
+                        slot_delta_image[(size_t) slot].reset();
+                        std::fprintf(stderr, "strata serve: layer-split session restored into slot %d: %zu tokens, %zu stages, %zu bytes\n",
+                                     slot, target.ids.size(), stages.size() + 1, bytes);
+                        std::printf("RESTORED %zu %zu %.1f\n", target.ids.size(), bytes, ms());
+                        continue;
+                    }
                     // host -> device into the slot's own state; a failure after the device was touched ends the engine
                     blocking("transfer", bytes);
                     if (strata::core::conversation_snapshot_restore(image, *bslot_ss[0][(size_t) slot], g, mtp.kv_state(),
