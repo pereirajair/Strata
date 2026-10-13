@@ -210,6 +210,7 @@ struct SessionReadLimits {
     uint64_t max_file_bytes = UINT64_MAX;
     uint64_t max_tokens = UINT64_MAX;       // token and image counts of the live state and of each checkpoint
     uint64_t max_checkpoints = UINT64_MAX;
+    uint64_t max_stages = UINT64_MAX;       // the layer-split stages' images (the file's stage count)
     uint64_t max_kv_layers = UINT64_MAX;
     // the runtime's geometry and layer range: a file with others is refused before its state arrays are read
     std::optional<std::array<int64_t, 18>> geometry;
