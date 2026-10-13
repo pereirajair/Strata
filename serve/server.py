@@ -1077,6 +1077,21 @@ class StrataEngine:
                 return line
         return None
 
+    def _await_bdone(self, slot: int) -> bool:
+        """Reads a slot's lines until its BDONE (its turn is over in the engine). True when it came."""
+        q = self.slot_q[slot]
+        end = time.monotonic() + 60.0
+        while time.monotonic() < end:
+            try:
+                line = q.get(timeout=5.0)
+            except queue.Empty:
+                continue
+            if line is None:
+                return False
+            if line.startswith("BDONE "):
+                return True
+        return False
+
     def _release_slot_when_done(self, slot: int, stream: list[int] | None = None):
         """A slot whose consumer left (a stop token, a stop string, a disconnect): BSTOP it and free it once the engine
         says BDONE (in the background).  `stream`: the prompt and every token of it so far - with the tokens still to
@@ -1416,7 +1431,21 @@ class StrataEngine:
             if slot is not None:
                 self.slot_live[slot] = None
                 self.slot_used[slot] = time.time()
-                if phase == "slot":
+                # a turn that ended on its own token (the consumer stopped at the EOS, or the length) is handed to its
+                # owner in the same way as at BDONE: the engine's BDONE comes at once, the slot holds the turn until then
+                natural = (phase == "slot" and turn_hook is not None and gen0 is not None and bool(out)
+                           and (out[-1] in EOS_IDS or len(out) >= int(max_new)))
+                if natural and self._await_bdone(slot):
+                    held_now = list(prompt) + out[gen0:-1]
+                    self.slot_held[slot] = held_now
+                    try:
+                        turn_hook(slot, list(held_now))
+                    except Exception as error:
+                        print(f"strata serve: turn hook failed: {error}", file=sys.stderr, flush=True)
+                    with self.slot_cv:
+                        self.slot_busy[slot] = False
+                        self.slot_cv.notify_all()
+                elif phase == "slot":
                     self.slot_held[slot] = []
                     stream = list(prompt) + out[gen0:] if gen0 is not None and len(out) > gen0 else None
                     self._release_slot_when_done(slot, stream)    # freed at its BDONE
