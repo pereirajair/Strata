@@ -11055,6 +11055,11 @@ int main(int argc, char** argv) {
                 }
                 if (save) {
                     if (!live_ok || live.empty()) { refuse("no complete session to save"); continue; }
+                    // The save of one conversation (the live state, its checkpoints, the K/V streamed to the file - whole,
+                    // or as a delta). A refusal is answered inside; false means one was.
+                    auto save_session = [&](strata::core::SessionState& ss, const std::vector<int32_t>& live,
+                                            const std::vector<ImgKey>& live_imgs, const std::vector<ConvCheckpoint>& checks,
+                                            bool cvec_cached, const auto& draft) -> bool {
                     size_t bytes = 0, kept = 0;
                     double capture_ms = 0;
                     try {
@@ -11107,7 +11112,7 @@ int main(int argc, char** argv) {
                         std::string why;
                         if (!strata::core::session_save_checkpoints(checks, sl, admit, disk_checks, why)) {
                             refuse(why, strata::core::SessionError::memory);
-                            continue;
+                            return false;
                         }
                         kept = disk_checks.size();
                         const strata::core::ConversationView view{live, live_imgs, disk_checks, cvec_cached};
@@ -11115,10 +11120,10 @@ int main(int argc, char** argv) {
                         std::vector<strata::core::SessionKvSource> sources;
                         // the live running state comes off the device in one synchronous copy
                         blocking("capture", sl.state_bytes == UINT64_MAX ? 0 : sl.state_bytes);
-                        if (!strata::core::conversation_snapshot_sources(meta, sources, view, ss, g, mtp.kv_state(),
+                        if (!strata::core::conversation_snapshot_sources(meta, sources, view, ss, g, draft,
                                                                          err)) {
                             refuse(err, strata::core::SessionError::io);
-                            continue;
+                            return false;
                         }
                         capture_ms = ms();
                         strata::core::SessionWriteOptions wo;
@@ -11130,15 +11135,15 @@ int main(int argc, char** argv) {
                             // a delta is cut from the base the other side holds: that base must still be a prefix of the
                             // live conversation (a rewind or a new branch is a whole session), and the K/V layers must be
                             // the same ones
-                            if (!delta_base.valid) { refuse("no base to cut a delta from: save the whole session first"); continue; }
+                            if (!delta_base.valid) { refuse("no base to cut a delta from: save the whole session first"); return false; }
                             if (live.size() < delta_base.ids.size() ||
                                 !std::equal(delta_base.ids.begin(), delta_base.ids.end(), live.begin())) {
                                 refuse("the base is not a prefix of the live conversation: save the whole session");
-                                continue;
+                                return false;
                             }
                             if (sources.size() != delta_base.cells.size()) {
                                 refuse("the K/V layers changed since the base: save the whole session");
-                                continue;
+                                return false;
                             }
                             std::vector<int64_t> base_cells = delta_base.cells, base_pooled = delta_base.pooled;
                             std::vector<strata::core::SessionKvSource> tails;
@@ -11148,11 +11153,11 @@ int main(int argc, char** argv) {
                             if (!strata::core::session_delta_write(path, meta, tails, base_cells, base_pooled, fp, id, bytes,
                                                                    err, wo, &st)) {
                                 refuse(err, st.error, st.published);
-                                continue;
+                                return false;
                             }
                         } else if (!strata::core::session_file_write(path, meta, sources, id, bytes, err, wo, &st)) {
                             refuse(err, st.error, st.published);
-                            continue;
+                            return false;
                         }
                         // the other side holds this session now: the next delta is cut from it
                         delta_base.valid = true;
@@ -11168,12 +11173,15 @@ int main(int argc, char** argv) {
                                                  "folder, so the new name is not flushed\n", path.c_str());
                     } catch (const std::bad_alloc&) {
                         refuse("not enough RAM to save the session", strata::core::SessionError::memory);
-                        continue;
+                        return false;
                     }
                     std::fprintf(stderr, "strata serve: session saved %zu tokens, %zu of %zu checkpoints, %zu bytes to %s "
                                  "in %.1f ms (state %.1f ms)\n", live.size(), kept, checks.size(), bytes,
                                  path.c_str(), ms(), capture_ms);
                     std::printf("SAVED %zu %zu %.1f\n", live.size(), bytes, ms());
+                        return true;
+                    };
+                    if (!save_session(ss, live, live_imgs, checks, cvec_cached, mtp.kv_state())) continue;
                 } else {
                     strata::core::SavedConversation image;
                     size_t bytes = 0;
