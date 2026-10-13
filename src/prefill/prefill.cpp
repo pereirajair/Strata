@@ -4116,14 +4116,26 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             const std::function<void()>& f;
             ~End() { if (f) f(); }
         } end{remote_prev_end};
-        for (int64_t c0 = 0; c0 < n; c0 += step) {
+        // with a layer split inside this process the chunk goes on to the next GPU on a thread (run_impl), so the
+        // rows of the next chunk can come in meanwhile; the chain is drained before the run returns
+        bool ok = true;
+        for (int64_t c0 = 0; ok && c0 < n; c0 += step) {
             const int64_t T = std::min(step, n - c0);
-            if (!remote_rows(T, err) || !remote_prev(tokens + c0, T, pos0 + c0, remote_rows_, err)) return false;
+            if (!remote_rows(T, err) || !remote_prev(tokens + c0, T, pos0 + c0, remote_rows_, err)) {
+                ok = false;
+                break;
+            }
             hand_in_ = remote_rows_;
             single_chunk_ = n <= step;
-            const bool ok = run_impl(tokens + c0, T, pos0 + c0, err);
+            ok = run_impl(tokens + c0, T, pos0 + c0, err);
             hand_in_ = nullptr;
-            if (!ok) return false;
+        }
+        std::string drain_err;
+        const bool drain_ok = drain_pipeline(drain_err);
+        if (!ok) return false;
+        if (!drain_ok) {
+            err = drain_err;
+            return false;
         }
         return true;
     }
