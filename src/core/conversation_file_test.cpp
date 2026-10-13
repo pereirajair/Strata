@@ -94,8 +94,8 @@ SavedConversation sample() {
 }
 
 // format v1 golden: the file the fixed sample() gives (size and session_hash64 of all bytes, seed 0)
-constexpr size_t kGoldenSize = 17878535;
-constexpr uint64_t kGoldenHash = 0x70f812b350360d09ull;
+constexpr size_t kGoldenSize = 17878543;
+constexpr uint64_t kGoldenHash = 0x4609d78897349d5bull;
 
 bool same_checkpoint(const ConversationCheckpoint& a, const ConversationCheckpoint& b) {
     return a.ids == b.ids && a.imgs == b.imgs && a.gdn == b.gdn && a.ple == b.ple && a.tails == b.tails &&
@@ -104,8 +104,11 @@ bool same_checkpoint(const ConversationCheckpoint& a, const ConversationCheckpoi
 
 bool same(const SavedConversation& a, const SavedConversation& b) {
     if (a.geometry != b.geometry || a.layer_lo != b.layer_lo || a.layer_hi != b.layer_hi || a.cvec != b.cvec ||
-        !same_checkpoint(a.live, b.live) || a.checkpoints.size() != b.checkpoints.size() || a.kv.size() != b.kv.size())
+        !same_checkpoint(a.live, b.live) || a.checkpoints.size() != b.checkpoints.size() || a.kv.size() != b.kv.size() ||
+        a.stage_images.size() != b.stage_images.size())
         return false;
+    for (size_t i = 0; i < a.stage_images.size(); ++i)
+        if (!same(a.stage_images[i], b.stage_images[i])) return false;
     for (size_t i = 0; i < a.checkpoints.size(); ++i)
         if (!same_checkpoint(a.checkpoints[i], b.checkpoints[i])) return false;
     for (size_t i = 0; i < a.kv.size(); ++i) {
@@ -164,14 +167,14 @@ int main() {
     check(session_file_write(good.string(), original, id, written, error), "write succeeds");
     check(error.empty(), "write leaves no error");
 
-    // golden: format v1 is frozen. The fixed sample must give these exact bytes (little-endian header fields at
+    // golden: format v2 is frozen. The fixed sample must give these exact bytes (little-endian header fields at
     // fixed offsets, and a fixed hash of the whole file); a format change must bump the version and this test.
     {
         const std::vector<char> g = slurp(good);
         auto u32 = [&](size_t o) { uint32_t v = 0; for (int i = 3; i >= 0; --i) v = v << 8 | uint8_t(g[o + i]); return v; };
         auto u64 = [&](size_t o) { uint64_t v = 0; for (int i = 7; i >= 0; --i) v = v << 8 | uint8_t(g[o + i]); return v; };
         check(g.size() >= 80 && std::memcmp(g.data(), "STRSESS\x01", 8) == 0, "golden: magic");
-        check(u32(8) == 1 && u32(12) == 64, "golden: version 1, header 64 bytes (little-endian)");
+        check(u32(8) == 2 && u32(12) == 64, "golden: version 2, header 64 bytes (little-endian)");
         check(u64(16) == id.model && u64(24) == id.config, "golden: fingerprints at offsets 16 and 24");
         check(u64(32) == g.size() - 64 - 16, "golden: payload length at offset 32");
         check(u64(40) == 0 && u64(48) == 0, "golden: reserved fields are zero");
@@ -244,7 +247,7 @@ int main() {
     // wrong version: header field patched and header hash recomputed so only the version differs
     {
         auto d = image;
-        uint32_t v = 2; std::memcpy(d.data() + 8, &v, 4);
+        uint32_t v = 3; std::memcpy(d.data() + 8, &v, 4);
         const uint64_t h = session_hash64(d.data(), 56, 0); std::memcpy(d.data() + 56, &h, 8);
         const fs::path p = dir / "ver.bin"; spit(p, d);
         check(rejects(p, id, "version"), "unknown version rejected");
@@ -277,6 +280,36 @@ int main() {
         const fs::path p = dir / "split.bin";
         check(!session_file_write(p.string(), split, id, written, error), "layer-split image refused");
         check(!fs::exists(p) && no_temp(dir), "refused write leaves no file");
+    }
+    // layer-split stages (one per GPU of a split): written after the state, read back identical; a stage's own stages
+    // and a stage count over the limit are refused; a delta does not carry stages
+    {
+        SavedConversation staged = sample();
+        SavedConversation stage = sample();
+        stage.geometry[0] = 777;                 // a stage of the same model, another layer range
+        stage.layer_lo = 33; stage.layer_hi = 48;
+        staged.stage_images.push_back(stage);
+        const fs::path p = dir / "staged.bin";
+        check(session_file_write(p.string(), staged, id, written, error), "a state with its stage's image is written");
+        check(no_temp(dir), "no temporary after the staged write");
+        SavedConversation back;
+        size_t read = 0;
+        check(session_file_read(p.string(), id, back, read, error), "a file with stage images reads back");
+        check(back.stage_images.size() == 1 && same(back.stage_images[0], stage), "the stage's image is identical");
+        check(same(back, staged), "the state with its stage images is identical");
+        SavedConversation limited;
+        SessionReadLimits lim;
+        lim.max_stages = 0;
+        check(!session_file_read(p.string(), id, limited, read, error, lim), "a stage count over the limit is refused");
+        SavedConversation nested = staged;
+        nested.stage_images[0].stage_images.push_back(stage);
+        check(!session_file_write((dir / "nested.bin").string(), nested, id, written, error),
+              "a stage's own stages are refused");
+        std::vector<SessionKvSource> none;
+        size_t dbytes = 0;
+        check(!session_delta_write((dir / "delta.bin").string(), staged, none, {}, {}, 0, id, dbytes, error),
+              "a delta with stage images is refused");
+        check(error.find("delta") != std::string::npos, "the refusal says why");
     }
     // a write into a missing directory fails cleanly
     check(!session_file_write((dir / "nope" / "x.bin").string(), original, id, written, error),
