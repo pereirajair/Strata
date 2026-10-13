@@ -46,7 +46,7 @@ namespace strata::core {
 namespace {
 constexpr char kMagic[8] = {'S', 'T', 'R', 'S', 'E', 'S', 'S', '\x01'};
 constexpr char kEnd[8] = {'S', 'T', 'R', 'S', 'E', 'N', 'D', '\x01'};
-constexpr uint32_t kVersion = 1;
+constexpr uint32_t kVersion = 2;   // 2: the layer-split stages' images follow the state (stage_images)
 constexpr size_t kHeader = 64, kTrailer = 16;
 
 // Progress for a transfer: one report after every block that was handed to (or read from) the OS, whatever its size
@@ -687,7 +687,9 @@ void put_checkpoint(Out& o, const ConversationCheckpoint& c) {
     o.u64(c.used);
 }
 
-void put_payload(Out& o, const SavedConversation& s, const std::vector<SessionKvSource>* sources = nullptr) {
+// `stages`: the image's own layer-split stages follow it (a stage's own stages are not written: there is one level).
+void put_payload(Out& o, const SavedConversation& s, const std::vector<SessionKvSource>* sources = nullptr,
+                 bool stages = true) {
     for (int64_t g : s.geometry) o.i64(g);
     o.i64(s.layer_lo); o.i64(s.layer_hi); o.u64(s.cvec ? 1 : 0);
     put_checkpoint(o, s.live);
@@ -699,12 +701,16 @@ void put_payload(Out& o, const SavedConversation& s, const std::vector<SessionKv
             put_kv_header(o, k.format, k.cells, k.heads, k.head_dim, k.page_size, k.pooled_rows, k.idx_dim);
             for (size_t part = 0; part < 5; ++part) o.source(k, part);
         }
-        return;
+    } else {
+        o.u64(s.kv.size());
+        for (const auto& k : s.kv) {
+            put_kv_header(o, k.format, k.cells, k.heads, k.head_dim, k.page_size, k.pooled_rows, k.idx_dim);
+            o.buffer(k.k); o.buffer(k.v); o.buffer(k.k_scale); o.buffer(k.v_scale); o.buffer(k.pooled);
+        }
     }
-    o.u64(s.kv.size());
-    for (const auto& k : s.kv) {
-        put_kv_header(o, k.format, k.cells, k.heads, k.head_dim, k.page_size, k.pooled_rows, k.idx_dim);
-        o.buffer(k.k); o.buffer(k.v); o.buffer(k.k_scale); o.buffer(k.v_scale); o.buffer(k.pooled);
+    if (stages) {
+        o.u64(s.stage_images.size());
+        for (const auto& st : s.stage_images) put_payload(o, st, nullptr, false);
     }
 }
 
@@ -763,7 +769,7 @@ bool get_checkpoint(In& in, ConversationCheckpoint& c) {
            in.vec(c.block_pos, m[4]) && in.u64(c.used);
 }
 
-bool get_payload(In& in, SavedConversation& s) {
+bool get_payload(In& in, SavedConversation& s, bool stages = true) {
     for (auto& g : s.geometry) if (!in.i64(g)) return false;
     // checked before any state array is read: a file of another geometry allocates nothing
     if (in.limits.geometry && *in.limits.geometry != s.geometry)
@@ -793,6 +799,11 @@ bool get_payload(In& in, SavedConversation& s) {
         if (!in.buffer(k.k, 0) || !in.buffer(k.v, 1) || !in.buffer(k.k_scale, 2) || !in.buffer(k.v_scale, 3) ||
             !in.buffer(k.pooled, 4)) return false;
     }
+    if (!stages) return true;
+    // the stages' own images: a count the caller accepts, then each image (one level: its own stages are not read)
+    if (!in.count(n, 16, in.limits.max_stages)) return false;
+    s.stage_images.resize((size_t) n);
+    for (auto& st : s.stage_images) if (!get_payload(in, st, false)) return false;
     return true;
 }
 
@@ -1031,6 +1042,8 @@ bool write_impl(const std::string& path, const SavedConversation& image, const s
     st = {};
     st.error = SessionError::invalid;   // refusals before any disk access
     if (has_stage_parts(image)) { error = "session file: layer-split state cannot be saved"; return false; }
+    for (const auto& st : image.stage_images)
+        if (has_stage_parts(st) || !st.stage_images.empty()) { error = "session file: a stage's own stages are not saved"; return false; }
     if (sources && !image.kv.empty()) { error = "session file: K/V given both in the image and as sources"; return false; }
     Out sizing;
     put_payload(sizing, image, sources);
@@ -1342,7 +1355,10 @@ bool write_delta_impl(const std::string& path, const SavedConversation& meta, co
                       SessionStatus& st) {
     st = {};
     st.error = SessionError::invalid;
-    if (has_stage_parts(meta)) { error = "session delta: layer-split state cannot be saved as a delta"; return false; }
+    if (has_stage_parts(meta) || !meta.stage_images.empty()) {
+        error = "session delta: layer-split state cannot be saved as a delta";
+        return false;
+    }
     if (!meta.kv.empty()) { error = "session delta: the metadata must carry no K/V"; return false; }
     if (tails.size() != base_cells.size() || tails.size() != base_pooled.size()) {
         error = "session delta: one base extent per K/V layer is required";
