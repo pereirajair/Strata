@@ -3870,10 +3870,14 @@ int main(int argc, char** argv) {
     const int64_t kStageLayers = 48;   // the qwen4exp geometry (Qwen4ExpGuard)
     if (stage_mode || o.stage_serve || !o.stage_prev.empty()) {
         const char* why = !stage_mode ? "--stage-serve and --stage-prev need --native with a layer slice"
-                        : !o.layer_split.empty() ? "a stage per process runs on one GPU: no --layer-split"
-                        : o.stage_serve && o.stage_lo != 0 ? "--stage-serve is the first stage (layer 0)"
+                        : !split_auto && [&] {
+                              for (const int64_t k : split_at)
+                                  if (k <= o.stage_lo || k >= std::min<int64_t>(o.stage_hi, kStageLayers)) return true;
+                              return false;
+                          }() ? "a stage's --layer-split points must fall inside its own layers"
                         : o.stage_serve && o.stage_hi >= kStageLayers ? "the last stage serves the requests (--serve)"
-                        : !o.stage_serve && o.stage_lo > 0 && o.stage_prev.empty() ? "a stage after layer 0 needs --stage-prev"
+                        : o.stage_lo > 0 && o.stage_prev.empty() ? "a stage after layer 0 needs --stage-prev"
+                        : o.stage_lo == 0 && !o.stage_prev.empty() ? "the first stage (layer 0) has no --stage-prev"
                         : !o.stage_serve && o.stage_hi < kStageLayers ? "a stage before the last layer runs as --stage-serve"
                         : nullptr;
         if (why != nullptr) {
@@ -3898,7 +3902,9 @@ int main(int argc, char** argv) {
             o.spec = std::max(o.spec, strata::kernels::kVerifyMaxT);  // any window the last stage sends
         }
         std::fprintf(stderr, "strata generate: stage of layers %lld-%lld (%s)\n", (long long) o.stage_lo,
-                     (long long) o.stage_hi - 1, o.stage_serve ? "serving the next stage" : "after a remote stage");
+                     (long long) o.stage_hi - 1,
+                     o.stage_serve ? (o.stage_lo > 0 ? "after a remote stage, serving the next one" : "serving the next stage")
+                                   : "after a remote stage");
     }
     // P7 audit: positions, cells and pooled-block indices are cast to int32 on the device path.
     if (o.max_context > 2147483647LL - 8) {
@@ -4468,6 +4474,10 @@ int main(int argc, char** argv) {
     // the device with the most room, and on the 4-way IQ3_S rig the trim buys it 4598 -> 4608 slots.  The VRAM
     // is on the later cards (CUDA2 1241 -> 2485, CUDA3 533 -> 1772), and THEIR weights load after the search,
     // so they trim under `auto` too - see the block past it.
+    // A LAYER SPLIT INSIDE ONE STAGE OF A SPLIT ACROSS PROCESSES: the GPUs share this process's layers
+    // [split_lo, split_hi) - the whole model without a stage - and the first and last of them meet the other processes
+    const int64_t split_lo = stage_mode ? o.stage_lo : 0;
+    auto split_hi = [&]() -> int64_t { return stage_mode && o.stage_hi < g.n_layers ? o.stage_hi : g.n_layers; };
     const bool stage_trim = trim_asked && multi_gpu && !split_auto && !split_at.empty();
     if (o.trim_stage_weights && !multi_gpu)
         std::fprintf(stderr, "strata generate: --trim-stage-weights needs a layer split across GPUs (ignored)\n");
@@ -4493,10 +4503,12 @@ int main(int argc, char** argv) {
         std::fclose(f);
     };
     if (stage_trim) {
-        add_foreign(0, split_at[0], skip, o.mmap_experts);
-        strata::core::NativeDense::set_layer_range(0, (int) split_at[0]);
-        std::fprintf(stderr, "strata generate: layer split: CUDA0 loads the dense weights of layers 0-%lld only\n",
-                     (long long) split_at[0] - 1);
+        add_foreign(split_lo, split_at[0], skip, o.mmap_experts);
+        strata::core::NativeDense::set_layer_range((int) split_lo, (int) split_at[0]);
+        std::fprintf(stderr, "strata generate: layer split: CUDA0 loads the dense weights of layers %lld-%lld only\n",
+                     (long long) split_lo, (long long) split_at[0] - 1);
+    } else if (stage_mode) {
+        strata::core::NativeDense::set_layer_range((int) o.stage_lo, (int) o.stage_hi);
     }
     // STRATA_HC_REQ8=1 (opt-in, changes the output): the hyper-connection projections are not loaded as BF16;
     // load_hc_q8 below requantizes them to int8 + an fp32 scale per 32 values (~0.56x the bytes), and the freed VRAM
@@ -4507,7 +4519,6 @@ int main(int argc, char** argv) {
                              "projections are used\n");
     const bool hc_q8 = hc_req8_env && !multi_gpu;
     if (hc_q8) strata::core::WeightTable::hc_q8_names(g.n_layers, skip);
-    if (stage_mode) strata::core::NativeDense::set_layer_range((int) o.stage_lo, (int) o.stage_hi);
     uint64_t pool_bytes = 0;
     if (!strata::core::WeightTable::pool_bytes(o.pack, pool_bytes, err, skip.empty() ? nullptr : &skip)) {
         std::fprintf(stderr, "strata generate: %s\n", err.c_str());
@@ -5076,7 +5087,7 @@ int main(int argc, char** argv) {
         // the split search (see late_weights), so `auto` can trim them too.
         if (!late_weights) {
             const int64_t lb = stage_trim ? split_at[i] : 0;
-            const int64_t le = stage_trim ? (i + 1 < split_at.size() ? split_at[i + 1] : g.n_layers) : 0;
+            const int64_t le = stage_trim ? (i + 1 < split_at.size() ? split_at[i + 1] : split_hi()) : 0;
             if (!load_stage_weights(st, lb, le, stage_trim)) return 1;
         }
         // THE SESSION AND THE HEAD WAIT FOR THE SPLIT SEARCH.  `session_bytes` prices a stage's session by its
@@ -5418,8 +5429,8 @@ int main(int argc, char** argv) {
             // is why the sessions are allocated after the search: `session_bytes` is pure arithmetic.
             std::vector<int64_t> capr((size_t) ns);
             for (int i = 0; i < ns; ++i) {
-                const int64_t lb = i == 0 ? 0 : at[(size_t) i - 1];
-                const int64_t le = i + 1 < ns ? at[(size_t) i] : g.n_layers;
+                const int64_t lb = i == 0 ? split_lo : at[(size_t) i - 1];
+                const int64_t le = i + 1 < ns ? at[(size_t) i] : split_hi();
                 capr[(size_t) i] = stage_left(i, lb, le);
             }
             std::fill(used.begin(), used.end(), 0);
@@ -5448,7 +5459,7 @@ int main(int argc, char** argv) {
                 ms += miss_ms * link_scale[(size_t) i] * std::max(0.0, mass_i[(size_t) i] - held_i[(size_t) i]) /
                       std::max(total_mass, 1e-9);
             for (int i = 0; i < ns; ++i) {
-                const int64_t lb = i == 0 ? 0 : at[(size_t) i - 1], le = i + 1 < ns ? at[(size_t) i] : g.n_layers;
+                const int64_t lb = i == 0 ? split_lo : at[(size_t) i - 1], le = i + 1 < ns ? at[(size_t) i] : split_hi();
                 ms += (double) (le - lb) * layer_ms[(size_t) i];
             }
             return ms;
@@ -5467,7 +5478,7 @@ int main(int argc, char** argv) {
         auto stage_max = [&](const std::vector<int64_t>& cuts) {
             double m = 0;
             for (int i = 0; i < ns; ++i) {
-                const int64_t lb = i == 0 ? 0 : cuts[(size_t) i - 1], le = i + 1 < ns ? cuts[(size_t) i] : g.n_layers;
+                const int64_t lb = i == 0 ? split_lo : cuts[(size_t) i - 1], le = i + 1 < ns ? cuts[(size_t) i] : split_hi();
                 m = std::max(m, (double) (le - lb) * layer_ms[(size_t) i]);
             }
             return m;
@@ -5581,8 +5592,8 @@ int main(int argc, char** argv) {
         auto parts_of = [&](const std::vector<int64_t>& at) {
             std::vector<PartStat> parts((size_t) ns);
             for (int i = 0; i < ns; ++i) {
-                parts[i].lb = i == 0 ? 0 : at[i - 1];
-                parts[i].le = i + 1 < ns ? at[i] : g.n_layers;
+                parts[i].lb = i == 0 ? split_lo : at[i - 1];
+                parts[i].le = i + 1 < ns ? at[i] : split_hi();
                 parts[i].used = used[i];
                 parts[i].cnt = held_cnt[i];
                 parts[i].cap = stage_left(i, parts[i].lb, parts[i].le);
@@ -5613,7 +5624,7 @@ int main(int argc, char** argv) {
                 best = at; best_ms = std::min(ms, best_ms); best_mass = hm; best_held = held; best_max = mx;
             }
         };
-        const int64_t L = g.n_layers;
+        const int64_t L = split_hi(), L0 = split_lo;   // the layers this process runs: [L0, L)
         // share the layers in proportion to speed: the fallback beyond four GPUs, and the only placement a
         // model too small to hold four stages has (see the ns == 4 branch).
         auto proportional = [&]() {
@@ -5622,20 +5633,20 @@ int main(int argc, char** argv) {
             double acc = 0;
             for (int i = 0; i + 1 < ns; ++i) {
                 acc += 1.0 / layer_ms[(size_t) i];
-                at[(size_t) i] = std::clamp<int64_t>((int64_t) std::llround(acc / total * (double) L),
-                                                     i == 0 ? 2 : at[(size_t) i - 1] + 1, L - (ns - 1 - i));
+                at[(size_t) i] = std::clamp<int64_t>(L0 + (int64_t) std::llround(acc / total * (double) (L - L0)),
+                                                     i == 0 ? L0 + 2 : at[(size_t) i - 1] + 1, L - (ns - 1 - i));
             }
             consider();
         };
         auto search = [&]() {
         priced.clear();
         if (ns == 2) {
-            for (int64_t k = 2; k < L; ++k) { at[0] = k; consider(); }
+            for (int64_t k = L0 + 2; k < L; ++k) { at[0] = k; consider(); }
             // a model with fewer than three layers enumerates nothing: keep the proportional guess rather than
             // leave `best` empty (an empty split would read split_at[i] out of bounds at the stage lb/le loop)
             if (best.empty()) proportional();
         } else if (ns == 3) {
-            for (int64_t k1 = 2; k1 + 1 < L; ++k1)
+            for (int64_t k1 = L0 + 2; k1 + 1 < L; ++k1)
                 for (int64_t k2 = k1 + 1; k2 < L; ++k2) { at[0] = k1; at[1] = k2; consider(); }
             if (best.empty()) proportional();
         } else if (ns == 4) {
@@ -5684,14 +5695,14 @@ int main(int argc, char** argv) {
                 return key;
             };
             const double denom = std::max(total_mass, 1e-9);
-            for (int64_t k1 = 2; k1 + 2 < L; ++k1)
+            for (int64_t k1 = L0 + 2; k1 + 2 < L; ++k1)
                 for (int64_t k2 = k1 + 1; k2 + 1 < L; ++k2)
                     for (int64_t k3 = k2 + 1; k3 < L; ++k3) {
-                        const size_t a = range_hold(0, 0, k1), b = range_hold(1, k1, k2);
+                        const size_t a = range_hold(0, L0, k1), b = range_hold(1, k1, k2);
                         const size_t c = range_hold(2, k2, k3), d = range_hold(3, k3, L);
                         const double hm = held_mass_at[a] + held_mass_at[b] + held_mass_at[c] + held_mass_at[d];
                         const double ms = miss_ms * (1.0 - hm / denom) +
-                                          (double) k1 * layer_ms[0] + (double) (k2 - k1) * layer_ms[1] +
+                                          (double) (k1 - L0) * layer_ms[0] + (double) (k2 - k1) * layer_ms[1] +
                                           (double) (k3 - k2) * layer_ms[2] + (double) (L - k3) * layer_ms[3];
                         if (min_stage_layers > 1 &&
                             strata::program::split_rules::smallest_stage({k1, k2, k3}, L) < min_stage_layers) continue;
@@ -5700,7 +5711,7 @@ int main(int argc, char** argv) {
                         const double mx = stage_max({k1, k2, k3});
                         if (!(ms < best_ms - tie_eps || (ms <= best_ms + tie_eps && mx < best_max - tie_eps))) continue;
                         if (gate_on) {   // the same startability gate as `consider`, over the memoised fills
-                            const int64_t lbs[4] = {0, k1, k2, k3};
+                            const int64_t lbs[4] = {L0, k1, k2, k3};
                             const int64_t les[4] = {k1, k2, k3, L};
                             std::vector<PartStat> parts((size_t) ns);
                             for (int i = 0; i < ns; ++i) {
@@ -5795,8 +5806,8 @@ int main(int argc, char** argv) {
             const int64_t c = 512;
             for (int i = 0; i < ns; ++i) {
                 const int dev = i == 0 ? 0 : stages[(size_t) i - 1]->dev;
-                const int64_t lb = i == 0 ? 0 : at[(size_t) i - 1];
-                const int64_t le = i + 1 < ns ? at[(size_t) i] : g.n_layers;
+                const int64_t lb = i == 0 ? split_lo : at[(size_t) i - 1];
+                const int64_t le = i + 1 < ns ? at[(size_t) i] : split_hi();
                 const uint64_t cn = chunk_bytes(lb, c);
                 const int64_t room_mib = (int64_t) (stage_left(i, lb, le) >> 20);
                 std::fprintf(stderr, "strata generate:   CUDA%d: a 512-token prompt needs %lld MiB of its own buffers "
@@ -5865,7 +5876,7 @@ int main(int argc, char** argv) {
         }
     }
     for (size_t i = 0; i < split_at.size(); ++i)
-        if (split_at[i] >= g.n_layers) {
+        if (split_at[i] >= split_hi()) {
             std::fprintf(stderr, "strata generate: --layer-split: layer %lld is past the last (%lld)\n",
                          (long long) split_at[i], (long long) (g.n_layers - 1));
             return 2;
@@ -5890,7 +5901,7 @@ int main(int argc, char** argv) {
         profile.swap(mine);
         for (size_t i = 0; i < stages.size(); ++i) {
             stages[i]->lb = split_at[i];
-            stages[i]->le = i + 1 < stages.size() ? split_at[i + 1] : g.n_layers;
+            stages[i]->le = i + 1 < stages.size() ? split_at[i + 1] : split_hi();
         }
     }
 
@@ -9446,7 +9457,7 @@ int main(int argc, char** argv) {
         // whose cache already filled its reserve, that is the over-subscription the auto sizing avoids - so the
         // chunk is the largest one EVERY participant can lend (a smaller chunk only reads slower)
         if (pf_borrow && d_res != nullptr) {
-            pf_parts.push_back({&xcache, &ss, &sp, -1, 0, multi_gpu ? split_at[0] : g.n_layers, -1, -1, 0, {}});
+            pf_parts.push_back({&xcache, &ss, &sp, -1, split_lo, multi_gpu ? split_at[0] : g.n_layers, -1, -1, 0, {}});
             for (auto& st : stages)
                 pf_parts.push_back({&st->cache, &st->ss, &st->sp, st->dev, st->lb, st->le, -1, -1, 0, {}});
             // The two tests plan_lend makes for CUDA0 alone, one participant at a time: a loan must leave the
@@ -9779,7 +9790,10 @@ int main(int argc, char** argv) {
         auto init_prompt_paths = [&]() -> int {   // 0: ready; 1: failed (err set); 2: failed with "do not fit"
             for (size_t i = 0; i < stages.size(); ++i) {
                 GpuStage& st = *stages[i];
-                st.sp.set_stage(st.lb, i + 1 < stages.size() ? st.le : -1, i + 1 < stages.size() ? &stages[i + 1]->sp : nullptr);
+                // the last GPU runs to the model's end - or, in an earlier stage's process, to the slice's, and hands
+                // its rows on to the next process (remote_next, set by the stage server)
+                st.sp.set_stage(st.lb, i + 1 < stages.size() || split_hi() < g.n_layers ? st.le : -1,
+                                i + 1 < stages.size() ? &stages[i + 1]->sp : nullptr);
                 const strata::core::OnDevice on(st.dev);
                 void* sb = nullptr;              // this stage's own loan, out of its own cache
                 uint64_t sbb = 0;
@@ -9795,7 +9809,7 @@ int main(int argc, char** argv) {
                     return err.find("do not fit") != std::string::npos ? 2 : 1;
                 }
             }
-            if (multi_gpu) sp.set_stage(0, split_at[0], &stages[0]->sp);
+            if (multi_gpu) sp.set_stage(split_lo, split_at[0], &stages[0]->sp);
             else if (stage_mode) sp.set_stage(o.stage_lo, o.stage_hi < kStageLayers ? o.stage_hi : -1, nullptr);
             if (share_pool) sp.set_cpu_pool(&pool);
             if (!sp.init(wt, g, ss, prefill_src, &xcache, host_res.data(), o.prefill_chunk, main_cs, err, borrow, borrow_bytes,
@@ -10013,6 +10027,37 @@ int main(int argc, char** argv) {
                     stage_ver_p(st, par).set_always_publish(true);
                 }
         }
+#if !defined(_WIN32)
+        // A STAGE PER PROCESS: the verify window's hand-offs live in mapped pinned memory, as between the GPUs of a
+        // --layer-split; an earlier stage's process fills `stage_hand_in` before each window (Verifier::
+        // set_remote_prev), and a stage server reads `stage_hand_out` after it.  Portable: with a layer split inside
+        // the stage, the first and the last GPU are two devices.
+        float* stage_hand_in = nullptr;
+        float* stage_hand_out = nullptr;
+        float* stage_in_dev = nullptr;
+        float* stage_out_dev = nullptr;
+        if (stage_mode) {
+            const size_t hb = (size_t) strata::kernels::kVerifyMaxT *
+                              (size_t) strata::core::Verifier::handoff_floats(g) * sizeof(float);
+            auto mapped = [&](float*& host) -> float* {
+                float* dev = nullptr;
+                if (cudaHostAlloc((void**) &host, hb, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
+                    cudaHostGetDevicePointer((void**) &dev, host, 0) != cudaSuccess)
+                    return nullptr;
+                std::memset(host, 0, hb);
+                return dev;
+            };
+            stage_in_dev = o.stage_lo > 0 ? mapped(stage_hand_in) : nullptr;
+            stage_out_dev = o.stage_hi < kStageLayers ? mapped(stage_hand_out) : nullptr;
+            if ((o.stage_lo > 0 && stage_in_dev == nullptr) || (o.stage_hi < kStageLayers && stage_out_dev == nullptr)) {
+                std::fprintf(stderr, "strata serve: the stage hand-off allocation failed\n");
+                return 1;
+            }
+        }
+#else
+        float* stage_in_dev = nullptr;
+        float* stage_out_dev = nullptr;
+#endif
         if (n_stages > 1) {
             // pipelined slot groups write their rows at hbase = group * rows-per-group, so with more than
             // kVerifyMaxT slots in groups the hand-off holds one row per slot (otherwise kVerifyMaxT, as before)
@@ -10056,15 +10101,19 @@ int main(int argc, char** argv) {
             split_drive.base = &drive;
             split_drive.n = n_stages;
             for (int st = 0; st < n_stages; ++st) {
-                stage_ver(st).set_stage(st == 0 ? 0 : split_at[(size_t) st - 1], st + 1 < n_stages ? split_at[(size_t) st] : -1,
-                                        st == 0 ? nullptr : hand[(size_t) st - 1], st + 1 < n_stages ? hand[(size_t) st] : nullptr);
+                // inside a stage per process the first GPU takes the earlier process's rows and the last hands its own on
+                const bool last = st + 1 == n_stages;
+                stage_ver(st).set_stage(st == 0 ? split_lo : split_at[(size_t) st - 1],
+                                        !last ? split_at[(size_t) st] : split_hi() < g.n_layers ? split_hi() : -1,
+                                        st == 0 ? stage_in_dev : hand[(size_t) st - 1],
+                                        !last ? hand[(size_t) st] : stage_out_dev);
                 if (hrows > strata::kernels::kVerifyMaxT) stage_ver(st).set_handoff_rows(hrows);
                 if (overlap)
                     stage_ver(st).set_handoff_flags(st == 0 ? nullptr : hflag_h[(size_t) st - 1],
                                                     st == 0 ? nullptr : hflag_d[(size_t) st - 1],
                                                     st + 1 < n_stages ? hflag_h[(size_t) st] : nullptr,
                                                     st + 1 < n_stages ? hflag_d[(size_t) st] : nullptr);
-                split_drive.end[st] = st + 1 < n_stages ? split_at[(size_t) st] : g.n_layers;
+                split_drive.end[st] = !last ? split_at[(size_t) st] : split_hi();
                 split_drive.cache_base[st] = drive.d.cache_base;
                 split_drive.cache_slot_off[st] = drive.d.cache_slot_off;
                 split_drive.pcie_num[st] = pcie_num_of(o.pcie_frac);
@@ -10100,7 +10149,7 @@ int main(int argc, char** argv) {
                 }
             }
             for (int st = 0; st + 1 < n_stages; ++st) stage_ver(st).set_next(&stage_ver(st + 1), &split_drive);
-            std::string plan_s = "0-" + std::to_string(split_at[0] - 1) + " (CUDA0)";
+            std::string plan_s = std::to_string(split_lo) + "-" + std::to_string(split_at[0] - 1) + " (CUDA0)";
             for (int st = 1; st < n_stages; ++st)
                 plan_s += ", " + std::to_string(split_at[(size_t) st - 1]) + "-" + std::to_string(split_drive.end[st] - 1) +
                           " (CUDA" + std::to_string(split_same ? 0 : stages[(size_t) st - 1]->dev) + ")";
@@ -10166,35 +10215,24 @@ int main(int argc, char** argv) {
             for (int st = 0; st + 1 < n_stages; ++st) stage_ver_p(st, 1).set_next(&stage_ver_p(st + 1, 1), &split_drive_b);
         }
 #if !defined(_WIN32)
-        // A STAGE PER PROCESS: the verify window's hand-offs live in mapped pinned memory, as between the GPUs of a
-        // --layer-split; an earlier stage's process fills `stage_hand_in` before each window (Verifier::
-        // set_remote_prev), and a stage server reads `stage_hand_out` after it
-        float* stage_hand_in = nullptr;
-        float* stage_hand_out = nullptr;
         int64_t stage_piece = 0;   // a later stage: the prompt piece (tokens) and how many go ahead (the micro-pipeline)
         int stage_depth = 1;
+        bool stage_stream_external = false;   // a middle stage server streams several pieces of its own (below)
         if (stage_mode) {
-            const size_t hb = (size_t) strata::kernels::kVerifyMaxT *
-                              (size_t) strata::core::Verifier::handoff_floats(g) * sizeof(float);
-            auto mapped = [&](float*& host) -> float* {
-                float* dev = nullptr;
-                if (cudaHostAlloc((void**) &host, hb, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
-                    cudaHostGetDevicePointer((void**) &dev, host, 0) != cudaSuccess)
-                    return nullptr;
-                std::memset(host, 0, hb);
-                return dev;
-            };
-            float* in_dev = o.stage_lo > 0 ? mapped(stage_hand_in) : nullptr;
-            float* out_dev = o.stage_hi < kStageLayers ? mapped(stage_hand_out) : nullptr;
-            if ((o.stage_lo > 0 && in_dev == nullptr) || (o.stage_hi < kStageLayers && out_dev == nullptr)) {
-                std::fprintf(stderr, "strata serve: the stage hand-off allocation failed\n");
-                return 1;
+            // the first GPU takes the earlier process's rows and the last one hands its own on: with a layer split
+            // inside this stage those are two verifiers (set above), without it `ver` is both
+            if (n_stages > 1) {
+                if (stage_out_dev != nullptr) stage_ver(n_stages - 1).set_handoff_out_host(stage_hand_out);
+            } else {
+                ver.set_stage(o.stage_lo, o.stage_hi < kStageLayers ? o.stage_hi : -1, stage_in_dev, stage_out_dev);
+                if (stage_out_dev != nullptr) ver.set_handoff_out_host(stage_hand_out);
             }
-            ver.set_stage(o.stage_lo, o.stage_hi < kStageLayers ? o.stage_hi : -1, in_dev, out_dev);
-            if (out_dev != nullptr) ver.set_handoff_out_host(stage_hand_out);
             if (o.stage_lo > 0) {
-                // the earlier stage loads its slice too: wait for it (STRATA_STAGE_WAIT_S, 900 s by default)
-                const char* tok = std::getenv("STRATA_STAGE_TOKEN");
+                // the earlier stage loads its slice too: wait for it (STRATA_STAGE_WAIT_S, 900 s by default).  Its
+                // secret: STRATA_STAGE_PREV_TOKEN - a middle stage's own STRATA_STAGE_TOKEN is the one IT asks of
+                // the next stage - or STRATA_STAGE_TOKEN for the last stage
+                const char* tok = std::getenv("STRATA_STAGE_PREV_TOKEN");
+                if (tok == nullptr || *tok == 0) tok = std::getenv("STRATA_STAGE_TOKEN");
                 const char* ws = std::getenv("STRATA_STAGE_WAIT_S");
                 const auto until = Clock::now() + std::chrono::seconds(ws != nullptr ? std::atoi(ws) : 900);
                 std::string cerr;
@@ -10244,6 +10282,7 @@ int main(int argc, char** argv) {
                     return stage_prev.stream_take(n, rows, e);
                 };
                 sp.remote_prev_end = [&] {
+                    if (stage_stream_external) return;   // a middle stage server ends its own stream
                     if (const int d = stage_prev.stream_end(); d > 0)
                         std::fprintf(stderr, "strata serve: a prompt read through the earlier stage, up to %d pieces in "
                                              "flight\n", d);
@@ -11167,6 +11206,7 @@ int main(int argc, char** argv) {
             // a run's pieces for the micro-pipeline; the last piece of a chunk where on_chunk will take a periodic
             // checkpoint asks the earlier stage for one at the same place (the same rule, from pp_next_check)
             sp.remote_prev_begin = [&](const int64_t* t, int64_t n, int64_t p0, int64_t step, std::string& e) {
+                if (stage_stream_external) return true;   // a middle stage server: the stream is already open
                 std::vector<strata::stage::PrevStage::Piece> pieces;
                 int64_t ask_next = pp_next_check;
                 for (int64_t c0 = 0; c0 < n; c0 += step) {
@@ -13528,6 +13568,7 @@ int main(int argc, char** argv) {
             std::printf("READY stage\n");
             std::fflush(stdout);
             std::vector<char> req, ans, rows;
+            std::vector<int64_t> batch_tokens;   // a middle stage's gathered prompt pieces, while its stream reads them
             std::vector<int32_t> picks((size_t) strata::kernels::kVerifyMaxT);
             auto fail = [&](const std::string& m) {
                 ans.assign(1, (char) 1);
@@ -13575,6 +13616,13 @@ int main(int argc, char** argv) {
                 ConvCheckpoint c;
                 c.ids.assign(held.begin(), held.end());
                 if (cudaDeviceSynchronize() != cudaSuccess || !checkpoint_save(c, ss, g)) return false;
+                for (auto& st : stages) {   // a layer split inside the stage: every GPU's part
+                    const strata::core::OnDevice on(st->dev);
+                    ConvCheckpoint part;
+                    part.ids = c.ids;
+                    if (cudaDeviceSynchronize() != cudaSuccess || !checkpoint_save(part, st->ss, g)) return false;
+                    c.stage_parts.push_back(std::move(part));
+                }
                 c.used = ++held_clock;
                 held_checks.push_back(std::move(c));
                 while ((int) held_checks.size() > o.prompt_cache)
@@ -13594,7 +13642,9 @@ int main(int argc, char** argv) {
                 const int one = 1;
                 ::setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
                 bool hello = false, quit = false;
-                while (sl::recv_msg(cfd, req)) {
+                std::vector<char> next_req;   // a request read while gathering prompt pieces (a middle stage)
+                bool have_next = false, lost = false;
+                while (have_next ? (req.swap(next_req), have_next = false, true) : sl::recv_msg(cfd, req)) {
                     std::string e;
                     size_t at = 1;
                     const char op = req.empty() ? 0 : req[0];
@@ -13619,9 +13669,15 @@ int main(int argc, char** argv) {
                     } else if (op == 'Z') {
                         strata::core::session_zero(ss, g, nullptr, main_cs);
                         cudaStreamSynchronize(main_stream);
+                        for (auto& st : stages) {
+                            const strata::core::OnDevice on(st->dev);
+                            strata::core::session_zero(st->ss, g, nullptr, (void*) st->stream);
+                            cudaStreamSynchronize(st->stream);
+                        }
                         held.clear();
                         held_ok = true;
                         held_checks.clear();
+                        if (o.stage_lo > 0 && !stage_prev.reset(e)) fail(e);   // a middle stage: the earlier ones too
                         std::fprintf(stderr, "strata stage: a request from position 0\n");
                     } else if (op == 'R') {
                         std::vector<int32_t> ids;
@@ -13640,7 +13696,14 @@ int main(int argc, char** argv) {
                             fail("no state of this stage ends after those " + std::to_string(ids.size()) + " tokens");
                             std::fprintf(stderr, "strata stage: no state to continue after %zu tokens: the request reads "
                                                  "from position 0\n", ids.size());
-                        } else if (cudaDeviceSynchronize() != cudaSuccess || !checkpoint_restore(*c, ss, g)) {
+                        } else if (cudaDeviceSynchronize() != cudaSuccess || !checkpoint_restore(*c, ss, g) ||
+                                   c->stage_parts.size() != stages.size() || [&] {
+                                       for (size_t i = 0; i < stages.size(); ++i) {
+                                           const strata::core::OnDevice on(stages[i]->dev);
+                                           if (!checkpoint_restore(c->stage_parts[i], stages[i]->ss, g)) return true;
+                                       }
+                                       return false;
+                                   }()) {
                             held_lost("a checkpoint restore failed");
                             fail("restoring a checkpoint of this stage failed");
                         } else {
@@ -13657,42 +13720,123 @@ int main(int argc, char** argv) {
                             std::fprintf(stderr, "strata stage: a request continues after %zu tokens (a checkpoint)\n",
                                          ids.size());
                         }
+                        // a middle stage: the earlier stages continue after the same tokens, or nobody does
+                        if (ans[0] == 0 && o.stage_lo > 0) {
+                            std::vector<int64_t> ids64(ids.begin(), ids.end());
+                            int how = 0;
+                            if (!stage_prev.resume(ids64.data(), (int64_t) ids64.size(), how, e)) fail(e);
+                        }
                     } else if (op == 'S') {
                         std::vector<int32_t> ids;
                         if (!read_ids(at, ids)) fail("a malformed checkpoint request");
                         else if (!holds(ids)) fail("this stage's session does not hold those " + std::to_string(ids.size()) + " tokens");
                         else if (!save_held()) fail("saving a checkpoint of this stage failed");
+                        else if (o.stage_lo > 0) {   // a middle stage: the earlier stages keep theirs too
+                            std::vector<int64_t> ids64(ids.begin(), ids.end());
+                            if (!stage_prev.save(ids64.data(), (int64_t) ids64.size(), e)) fail(e);
+                        }
                     } else if (op == 'P') {
-                        int64_t pos0 = 0;
-                        uint32_t n = 0;
-                        bool save = false;
-                        const bool shaped = sl::get(req, at, pos0) && sl::get(req, at, n) && n > 0 &&
-                                            (req.size() == at + (size_t) n * 8 ||
-                                             (req.size() == at + (size_t) n * 8 + 1 && (save = req.back() != 0, true)));
-                        if (!shaped) {
+                        // A prompt piece.  A middle stage first gathers the pieces already waiting behind it (the later
+                        // stage sends them ahead) and asks its own earlier stage for all of them at once, so every
+                        // stage reads at the same time; each piece is answered as soon as it is read.
+                        struct PPiece {
+                            int64_t pos0 = 0;
+                            uint32_t n = 0;
+                            bool save = false;
+                            std::vector<int64_t> toks;
+                        };
+                        auto parse = [&](const std::vector<char>& r, PPiece& pc) -> bool {
+                            size_t q = 1;
+                            if (r.empty() || r[0] != 'P' || !sl::get(r, q, pc.pos0) || !sl::get(r, q, pc.n) || pc.n == 0)
+                                return false;
+                            if (r.size() == q + (size_t) pc.n * 8 + 1) pc.save = r.back() != 0;
+                            else if (r.size() != q + (size_t) pc.n * 8) return false;
+                            pc.toks.resize(pc.n);
+                            std::memcpy(pc.toks.data(), r.data() + q, (size_t) pc.n * 8);
+                            return true;
+                        };
+                        std::vector<PPiece> batch(1);
+                        if (!parse(req, batch[0])) {
                             fail("a malformed prompt chunk");
-                        } else if (!room(pos0 + n)) {
-                            fail("the K/V cannot grow to " + std::to_string(pos0 + n) + " cells");
                         } else {
-                            std::vector<int64_t> toks(n);
-                            std::memcpy(toks.data(), req.data() + at, (size_t) n * 8);
-                            ans.reserve(1 + (size_t) n * pf * sizeof(float));
-                            int64_t got = 0;
-                            sp.remote_next = [&](const float* r, int64_t T, int64_t, std::string&) {
-                                sl::put_bytes(ans, r, (size_t) T * pf * sizeof(float));
-                                got += T;
-                                return true;
-                            };
-                            if (held_ok && pos0 != (int64_t) held.size()) held_lost("a prompt piece not at its end");
-                            const bool ok = sp.run(toks.data(), n, pos0, e);
-                            sp.remote_next = nullptr;
-                            if (!ok || got != (int64_t) n) {
-                                fail(ok ? "the prompt chunk handed off " + std::to_string(got) + " rows" : e);
-                                held_lost("a prompt piece failed");
-                            } else if (held_ok) {
-                                held.insert(held.end(), toks.begin(), toks.end());
-                                if (save && !save_held()) std::fprintf(stderr, "strata stage: a checkpoint at %zu tokens "
-                                                                               "was not saved\n", held.size());
+                            if (o.stage_lo > 0) {
+                                while ((int) batch.size() < std::max(stage_depth, 1)) {
+                                    pollfd pfd{cfd, POLLIN, 0};
+                                    if (::poll(&pfd, 1, 0) <= 0 || (pfd.revents & POLLIN) == 0) break;
+                                    std::vector<char> more;
+                                    if (!sl::recv_msg(cfd, more)) {
+                                        lost = true;
+                                        break;
+                                    }
+                                    PPiece pc;
+                                    if (parse(more, pc) && pc.pos0 == batch.back().pos0 + (int64_t) batch.back().n) {
+                                        batch.push_back(std::move(pc));
+                                    } else {
+                                        next_req.swap(more);
+                                        have_next = true;
+                                        break;
+                                    }
+                                }
+                                // the stream to the earlier stage, in this stage's own chunk steps (Prefill::run's)
+                                std::vector<int64_t> all;
+                                std::vector<sl::PrevStage::Piece> pieces;
+                                const int64_t step = std::max<int64_t>(1, sp.chunk());
+                                for (const PPiece& pc : batch) {
+                                    all.insert(all.end(), pc.toks.begin(), pc.toks.end());
+                                    for (int64_t a0 = 0; a0 < (int64_t) pc.n; a0 += step)
+                                        pieces.push_back({pc.pos0 + a0, std::min<int64_t>(step, (int64_t) pc.n - a0),
+                                                          pc.save && a0 + step >= (int64_t) pc.n});
+                                }
+                                std::string serr;
+                                if (stage_prev.stream_begin(all.data(), std::move(pieces), stage_depth, serr)) {
+                                    stage_stream_external = true;
+                                    batch_tokens.swap(all);   // the stream reads them until it ends
+                                } else {
+                                    fail(serr);
+                                    batch.resize(1);
+                                }
+                            }
+                            bool failed = ans[0] != 0;
+                            for (size_t k = 0; k < batch.size(); ++k) {
+                                const PPiece& pc = batch[k];
+                                if (k > 0) ans.assign(1, (char) 0);
+                                if (failed) {
+                                    fail(k == 0 ? std::string(ans.data() + 1, ans.size() - 1) : "an earlier prompt piece failed");
+                                } else if (!room(pc.pos0 + pc.n)) {
+                                    fail("the K/V cannot grow to " + std::to_string(pc.pos0 + pc.n) + " cells");
+                                    failed = true;
+                                } else {
+                                    ans.reserve(1 + (size_t) pc.n * pf * sizeof(float));
+                                    int64_t got = 0;
+                                    // the rows leave from this stage's last GPU (its own prompt path without a layer split)
+                                    strata::prefill::Prefill& out_sp = stages.empty() ? sp : stages.back()->sp;
+                                    out_sp.remote_next = [&](const float* r, int64_t T, int64_t, std::string&) {
+                                        sl::put_bytes(ans, r, (size_t) T * pf * sizeof(float));
+                                        got += T;
+                                        return true;
+                                    };
+                                    if (held_ok && pc.pos0 != (int64_t) held.size()) held_lost("a prompt piece not at its end");
+                                    std::string pe;
+                                    const bool ok = sp.run(pc.toks.data(), pc.n, pc.pos0, pe);
+                                    out_sp.remote_next = nullptr;
+                                    if (!ok || got != (int64_t) pc.n) {
+                                        fail(ok ? "the prompt chunk handed off " + std::to_string(got) + " rows" : pe);
+                                        held_lost("a prompt piece failed");
+                                        failed = true;
+                                    } else if (held_ok) {
+                                        held.insert(held.end(), pc.toks.begin(), pc.toks.end());
+                                        if (pc.save && !save_held())
+                                            std::fprintf(stderr, "strata stage: a checkpoint at %zu tokens was not saved\n",
+                                                         held.size());
+                                    }
+                                }
+                                // every piece but the last is answered here; the last one below, as any request
+                                if (k + 1 < batch.size() && !sl::send_msg(cfd, ans, ans[0] == 0 ? 1 : 0)) lost = true;
+                            }
+                            if (stage_stream_external) {
+                                stage_prev.stream_end();
+                                stage_stream_external = false;
+                                batch_tokens.clear();
                             }
                         }
                     } else if (op == 'W') {
@@ -13741,7 +13885,7 @@ int main(int argc, char** argv) {
                     }
                     // the rows of a piece or a window go as a tensor (the POM carries them in the deployment's precision)
                     const bool rows = (op == 'P' || op == 'W') && ans.size() > 1 && ans[0] == 0;
-                    if (!sl::send_msg(cfd, ans, rows ? 1 : 0) || quit) break;
+                    if (!sl::send_msg(cfd, ans, rows ? 1 : 0) || quit || lost) break;
                 }
                 ::close(cfd);
                 if (quit) break;
