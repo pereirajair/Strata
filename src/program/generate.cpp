@@ -12646,6 +12646,9 @@ int main(int argc, char** argv) {
             // fed).  Kept when the request ends (`cached`), so the next turn of that conversation continues from it
             // instead of reading its history again (see `slot_source` in the request path).
             std::vector<int32_t> ids;
+            // the prompt's last turn boundary (the state a next turn of the conversation can reuse): the checkpoint of
+            // that length is in `checks`, copied at admission; -1: none
+            int64_t turn_len = -1;
             bool cached = false;           ///< idle, and its sessions still hold `ids`
             bool cvec = true;              ///< the control vector setting `ids` were read with
             bool img = false;              ///< the conversation has pictures (never reused from the slot)
@@ -12694,6 +12697,7 @@ int main(int argc, char** argv) {
             std::fflush(stdout);
         };
         int admit_slot = -1;               ///< the slot the request being read will continue in (BGEN)
+        int64_t turn_ckpt_len = -1;        ///< the length of the last checkpoint taken at a turn boundary of this request
         long long admit_max_new = 0;
         auto batch_on = [&] { for (const BSlot& b : bs) if (b.active) return true; return false; };
         auto try_next_line = [&](std::string& out) -> bool {
@@ -14242,15 +14246,24 @@ int main(int argc, char** argv) {
                 auto slot_image = [&](int b, strata::core::SavedConversation& image, std::string& e) -> bool {
                     BSlot& sl = bs[(size_t) b];
                     const size_t n_st = stages.size();
+                    // a turn boundary of this conversation (sl.turn_len): the image is that checkpoint, the tokens are its own
                     std::vector<ConvCheckpoint> copy = sl.checks;
+                    std::vector<int32_t> live = sl.ids;
+                    if (sl.turn_len > 0) {
+                        auto at = std::find_if(copy.begin(), copy.end(), [&](const ConvCheckpoint& c) {
+                            return (int64_t) c.ids.size() == sl.turn_len; });
+                        if (at == copy.end()) { e = "the turn boundary's checkpoint is gone"; return false; }
+                        copy = {*at};
+                        live.assign(at->ids.begin(), at->ids.end());
+                    }
                     auto cs = strata::core::conversation_checkpoints_split(std::move(copy), n_st);
-                    const strata::core::ConversationView v0{sl.ids, std::vector<ImgKey>{}, cs.stage0, true};
+                    const strata::core::ConversationView v0{live, std::vector<ImgKey>{}, cs.stage0, true};
                     if (!strata::core::conversation_snapshot_save(image, v0, *bslot_ss[0][(size_t) b], g, split_draft(0), e))
                         return false;
                     for (size_t k = 0; k < n_st; ++k) {
                         const strata::core::OnDevice on(stages[k]->dev);
                         if (cudaDeviceSynchronize() != cudaSuccess) { e = "stage sync failed"; return false; }
-                        const strata::core::ConversationView vk{sl.ids, std::vector<ImgKey>{}, cs.parts[k], true};
+                        const strata::core::ConversationView vk{live, std::vector<ImgKey>{}, cs.parts[k], true};
                         strata::core::SavedConversation part;
                         if (!strata::core::conversation_snapshot_save(part, vk, *bslot_ss[k + 1][(size_t) b], g,
                                                                       split_draft(k + 1), e))
@@ -16404,6 +16417,7 @@ int main(int argc, char** argv) {
             // chat renders the same history - but not always the same header or the thinking of this reply - so that
             // checkpoint is the one it reuses.
             int64_t turn_at = -1;
+            turn_ckpt_len = -1;   // this request's turn boundary, set below when its checkpoint is taken
             if (o.prompt_cache > 0 && o.turn_token >= 0)
                 for (int64_t i = n - 1; i > resume; --i)
                     if (ids[(size_t) i] == o.turn_token) { turn_at = i; break; }
@@ -16556,6 +16570,7 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: checkpoint at %lld skipped: its state could not be copied out (see "
                                          "above); the request goes on without it\n", (long long) to);
                 }
+                if (to == turn_at) turn_ckpt_len = to;
 #if !defined(_WIN32)
                 if (stage_mode && o.stage_lo > 0 && o.prompt_cache > 0 && req_ckpt &&
                     (to == turn_at || to == root_at || to == message_at || to == pin_at)) {
@@ -17960,6 +17975,11 @@ int main(int argc, char** argv) {
                         for (ConvCheckpoint& c : sl.checks) ckpt_pool.give(std::move(c));
                     sl = BSlot{};
                     const auto tc2 = Clock::now();   // (the slot's old checkpoints freed)
+                    // the conversation's turn boundary: its checkpoint goes with the slot, so a split's save can write the
+                    // state a next turn reuses (the end of this turn is not that: the template re-renders its last part)
+                    if (turn_ckpt_len > 0)
+                        for (const ConvCheckpoint& c : checks)
+                            if ((int64_t) c.ids.size() == turn_ckpt_len) { sl.checks.push_back(c); sl.turn_len = turn_ckpt_len; break; }
                     sl.active = true;
                     sl.x = x;
                     sl.p = p;
