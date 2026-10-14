@@ -11275,8 +11275,8 @@ int main(int argc, char** argv) {
                     }
                     slot_delta_base[(size_t) slot] = {};   // deltas are not cut from a split: the next save is whole
                     std::fprintf(stderr, "strata serve: layer-split session of slot %d saved: %zu tokens, %zu stages, %zu bytes to %s\n",
-                                 slot, bs[(size_t) slot].ids.size(), stages.size() + 1, bytes, path.c_str());
-                    std::printf("SAVED %zu %zu %.1f\n", bs[(size_t) slot].ids.size(), bytes, ms());
+                                 slot, image.live.ids.size(), stages.size() + 1, bytes, path.c_str());
+                    std::printf("SAVED %zu %zu %.1f\n", image.live.ids.size(), bytes, ms());
                 } else if (save && slot >= 0) {
                     if (bslot_ss.empty() || slot >= (int) bs.size() || bs[(size_t) slot].active ||
                         bs[(size_t) slot].ids.empty() || bs[(size_t) slot].img) {
@@ -12697,9 +12697,6 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: pin=%lld: the cache has no checkpoint there to pin (it resumed from "
                                  "%lld)\n", (long long) req_pin, (long long) read_from);
             }
-            std::fprintf(stderr, "[diag] turn_at=%lld resume=%lld read_from=%lld n=%lld turn_token=%lld prompt_cache=%d\n",
-                         (long long) turn_at, (long long) resume, (long long) read_from, (long long) n,
-                         (long long) o.turn_token, o.prompt_cache);
             std::vector<int64_t> cuts = {reread_to, root_at, message_at, turn_at, n - 1};
             if (pin_at >= 0) {
                 cuts.push_back(pin_at);
@@ -13906,10 +13903,6 @@ int main(int argc, char** argv) {
                     sl = BSlot{};
                     // the conversation's turn boundary: its checkpoint goes with the slot, so a split's save can write the
                     // state a next turn reuses (the end of this turn is not that: the template re-renders its last part)
-                    std::fprintf(stderr, "[diag] admit slot %d: turn_ckpt_len=%lld live=%zu main_checks=", admit_slot,
-                                 (long long) turn_ckpt_len, live.size());
-                    for (const ConvCheckpoint& c : checks) std::fprintf(stderr, " %zu", c.ids.size());
-                    std::fprintf(stderr, "\n");
                     if (turn_ckpt_len > 0)
                         for (const ConvCheckpoint& c : checks)
                             if ((int64_t) c.ids.size() == turn_ckpt_len) { sl.checks.push_back(c); sl.turn_len = turn_ckpt_len; break; }
