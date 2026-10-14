@@ -3638,6 +3638,39 @@ bool Verifier::window_logprobs(const int32_t* targets, int T, int64_t pos0, int3
     return true;
 }
 
+bool Verifier::row_label_probs(int row, const std::vector<std::vector<int32_t>>& groups, std::vector<double>& probs,
+                               double& mass, std::string& err) {
+    if (next_ != nullptr) return next_->row_label_probs(row, groups, probs, mass, err);
+    const OnDevice on_device(device_);
+    if (head_logits_ == nullptr || n_vocab_ <= 0 || row < 0) {
+        err = "row_label_probs: no head logits for this window";
+        return false;
+    }
+    std::vector<float> h((size_t) n_vocab_);
+    if (cudaMemcpy(h.data(), head_logits_ + (size_t) row * (size_t) n_vocab_, h.size() * sizeof(float),
+                   cudaMemcpyDeviceToHost) != cudaSuccess) {
+        err = "row_label_probs: the head logits copy failed";
+        return false;
+    }
+    double maxv = h[0];
+    for (float v : h) maxv = std::max(maxv, (double) v);
+    double sum = 0.0;
+    for (float v : h) sum += std::exp((double) v - maxv);
+    probs.assign(groups.size(), 0.0);
+    mass = 0.0;
+    for (size_t g = 0; g < groups.size(); ++g) {
+        std::vector<int32_t> ids = groups[g];
+        std::sort(ids.begin(), ids.end());
+        ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+        double p = 0.0;
+        for (int32_t id : ids)
+            if (id >= 0 && (int64_t) id < n_vocab_) p += std::exp((double) h[(size_t) id] - maxv) / sum;
+        probs[g] = p;
+        mass += p;
+    }
+    return true;
+}
+
 namespace { bool g_commit_async = false; }
 void Verifier::set_commit_async(bool on) { g_commit_async = on && std::getenv("STRATA_COMMIT_SYNC") == nullptr; }
 
