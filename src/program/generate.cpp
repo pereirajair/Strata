@@ -24,6 +24,7 @@
 #include "strata/core/remote_expert_opt.hpp"
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/conversation_snapshot.hpp"
+#include "strata/core/conversation_topology.hpp"
 #include "strata/core/conversation_file.hpp"
 #include "strata/core/session_save_reclaim.hpp"
 #include "strata/core/conversation_memory.hpp"
@@ -11318,6 +11319,8 @@ int main(int argc, char** argv) {
                             refuse(err, strata::core::SessionError::io);
                             continue;
                         }
+                        // a split's file is read whole, on a machine with every layer: its layers are joined below
+                        if (stages.empty()) limits.layer_range.reset();
                         strata::core::SessionStatus st;
                         auto& base_image = slot_delta_image[(size_t) slot];
                         if (delta) {
@@ -11343,6 +11346,26 @@ int main(int argc, char** argv) {
                         continue;
                     }
                     if (!ok_read) continue;
+                    if (stages.empty() && !image.stage_images.empty()) {
+                        // a split's file on a machine with one GPU: its stages' images join into the one image this engine
+                        // restores (the state of each part is the stage image's own; the main image's copies of the parts
+                        // are dropped first)
+                        std::vector<strata::core::SavedConversation> parts;
+                        parts.push_back(std::move(image));
+                        for (auto& st_img : parts[0].stage_images) parts.push_back(std::move(st_img));
+                        parts[0].stage_images.clear();
+                        parts[0].live.stage_parts.clear();
+                        for (auto& c : parts[0].checkpoints) c.stage_parts.clear();
+                        strata::core::SavedConversation joined;
+                        std::string e;
+                        if (!strata::core::conversation_merge_stages(parts, joined, e)) { refuse(e, strata::core::SessionError::invalid); continue; }
+                        const auto& ss_all = *bslot_ss[0][(size_t) slot];
+                        if (joined.layer_lo != ss_all.layer_lo || joined.layer_hi != ss_all.layer_hi) {
+                            refuse("the session's layers are not this engine's layers", strata::core::SessionError::invalid);
+                            continue;
+                        }
+                        image = std::move(joined);
+                    }
                     if (split_slot || !image.stage_images.empty()) {
                         // a layer split: the file's topology must be this engine's (a conversion between topologies is not
                         // done here); every image is validated before any device state changes
