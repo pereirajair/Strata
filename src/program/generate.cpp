@@ -13320,6 +13320,10 @@ int main(int argc, char** argv) {
                 if (!pump(false)) return false;
             return pmtp_settle();
         };
+        // Decision probe (PROBE <id,id;id,id;...>): the label groups the next GEN reads its first token's probabilities
+        // of, and that request's own copy (probe_now is cleared once its first window has answered).
+        std::vector<std::vector<int32_t>> probe_groups, groups_now;
+        bool probe_armed = false, probe_now = false;
         for (;;) {
             line_drain_ms = 0.0;
             if (batch_on() || (piped && pipe_inflight())) {
@@ -13350,6 +13354,40 @@ int main(int argc, char** argv) {
             }
             // --batch: BSTOP <slot> ends that slot at its next batch window; BGEN <slot> <max_new> ... reads the
             // request's prompt and first token as a GEN 1, then continues it in that slot
+            if (line.rfind("PROBE ", 0) == 0) {
+                // the groups of token ids of each label, ';' between labels and ',' between the ids of one label
+                const std::string spec = line.substr(6);
+                std::vector<std::vector<int32_t>> parsed;
+                bool bad = false;
+                size_t at = 0;
+                while (!bad) {
+                    const size_t semi = spec.find(';', at);
+                    const std::string group = spec.substr(at, semi == std::string::npos ? std::string::npos : semi - at);
+                    std::vector<int32_t> ids;
+                    size_t k = 0;
+                    while (k < group.size()) {
+                        const size_t comma = group.find(',', k);
+                        const std::string one = group.substr(k, comma == std::string::npos ? std::string::npos : comma - k);
+                        try {
+                            ids.push_back((int32_t) std::stol(one));
+                        } catch (...) {
+                            bad = true;
+                            break;
+                        }
+                        if (comma == std::string::npos) break;
+                        k = comma + 1;
+                    }
+                    if (ids.empty()) bad = true;
+                    parsed.push_back(ids);
+                    if (semi == std::string::npos) break;
+                    at = semi + 1;
+                }
+                if (bad) std::printf("ERR PROBE: a label needs token ids\n");
+                probe_groups = bad ? std::vector<std::vector<int32_t>>() : parsed;
+                probe_armed = !bad;
+                std::fflush(stdout);
+                continue;
+            }
             if (line.rfind("BSTOP ", 0) == 0) {
                 const int b = std::atoi(line.c_str() + 6);
                 if (b >= 0 && b < (int) bs.size()) bs[(size_t) b].stop = true;
@@ -13397,6 +13435,11 @@ int main(int argc, char** argv) {
                 Clock::now() - profile_saved_at >= std::chrono::duration<double>(o.expert_profile_save_min * 60.0))
                 save_profile("periodic");
             if (line == "QUIT") break;
+            // the decision probe belongs to the request right after it (PROBE is sent just before GEN / BGEN)
+            probe_now = probe_armed;
+            groups_now = probe_now ? probe_groups : std::vector<std::vector<int32_t>>();
+            probe_armed = false;
+            probe_groups.clear();
             // the watchdog watches a request from here until this iteration ends, whichever way it ends
             struct BusyScope {
                 BusyScope() {
@@ -16670,6 +16713,19 @@ int main(int argc, char** argv) {
                             std::fprintf(stderr, "strata serve: STRATA_DUMP_FIRST_LOGITS: cannot write %s\n", path.c_str());
                         if (f) std::fclose(f);
                     }
+                }
+                if (first_window && probe_now) {   // the decision probe: the request's first generated token's row
+                    std::vector<double> label_probs;
+                    double label_mass = 0.0;
+                    if (!ver.row_label_probs(merged ? T - 1 : 0, groups_now, label_probs, label_mass, err)) {
+                        std::printf("ERR %s\n", err.c_str());
+                        return 1;
+                    }
+                    std::printf("PROBE_RESULT %zu", label_probs.size());
+                    for (const double pr : label_probs) std::printf(" %.9g", pr);
+                    std::printf(" %.9g\n", label_mass);
+                    std::fflush(stdout);
+                    probe_now = false;
                 }
                 int a = merged ? T - 1 : 0;   // a merged window commits every row, as the prompt windows do
                 while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
