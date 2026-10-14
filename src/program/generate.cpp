@@ -8531,6 +8531,8 @@ int main(int argc, char** argv) {
         Clock::time_point bt_start = Clock::now();
         int admit_slot = -1;               ///< the slot the request being read will continue in (BGEN)
         int64_t turn_ckpt_len = -1;        ///< the length of the last checkpoint taken at a turn boundary of this request
+        constexpr int32_t kImEndToken = 248046;   // <|im_end|> of the chat template (Qwen3.x)
+        constexpr int32_t kNewlineToken = 198;    // "\n"
         long long admit_max_new = 0;
         auto batch_on = [&] { for (const BSlot& b : bs) if (b.active) return true; return false; };
         auto try_next_line = [&](std::string& out) -> bool {
@@ -10770,6 +10772,13 @@ int main(int argc, char** argv) {
             // is cheaper to read again than the extra part costs (~0.3 s).
             const int64_t last_turn = turn_at;   // ckpt=0 drops the split there, the root is still looked for before it
             if (!req_ckpt) turn_at = -1;
+            // the turn boundary a next turn reuses: the end of the last user message, before its "<|im_end|>\n" (the
+            // template re-renders that end once the message is followed by an assistant turn). Without that end, the turn
+            // start itself is the boundary.
+            int64_t turn_ckpt_at = turn_at;
+            if (turn_at - 2 > resume && turn_at >= 2 && ids[(size_t) turn_at - 2] == kImEndToken &&
+                ids[(size_t) turn_at - 1] == kNewlineToken)
+                turn_ckpt_at = turn_at - 2;
             int64_t root_at = -1;
             if (o.prompt_cache > 0 && o.turn_token >= 0 && o.prompt_cache_root > 0 && (read_from == 0 || resumed_from0))
                 for (int64_t i = 1; i < last_turn; ++i)
@@ -10807,7 +10816,7 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: pin=%lld: the cache has no checkpoint there to pin (it resumed from "
                                  "%lld)\n", (long long) req_pin, (long long) read_from);
             }
-            std::vector<int64_t> cuts = {reread_to, root_at, message_at, turn_at, n - 1};
+            std::vector<int64_t> cuts = {reread_to, root_at, message_at, turn_at, turn_ckpt_at, n - 1};
             if (pin_at >= 0) {
                 cuts.push_back(pin_at);
                 std::sort(cuts.begin(), cuts.end());   // the skipped -1s first, n - 1 still last
@@ -10850,15 +10859,15 @@ int main(int argc, char** argv) {
                     break;
                 }
                 at = to;
-                if ((to == turn_at || to == root_at || to == message_at || to == pin_at) &&
+                if ((to == turn_at || to == turn_ckpt_at || to == root_at || to == message_at || to == pin_at) &&
                     !checkpoint_at(to, nullptr, to == message_at && to != turn_at && to != root_at && to != pin_at)) {   // the tail kind leaves first
                     std::printf("ERR saving a conversation checkpoint failed%s\n", ckpt_why.c_str());
                     return 1;
                 }
-                if (to == turn_at) turn_ckpt_len = to;
+                if (to == turn_ckpt_at && turn_ckpt_at >= 0) turn_ckpt_len = to;
 #if !defined(_WIN32)
                 if (stage_mode && o.stage_lo > 0 && o.prompt_cache > 0 && req_ckpt &&
-                    (to == turn_at || to == root_at || to == message_at || to == pin_at)) {
+                    (to == turn_at || to == turn_ckpt_at || to == root_at || to == message_at || to == pin_at)) {
                     std::string serr;   // the earlier stage's own checkpoint there; without it this one is not continued
                     if (!stage_prev.save(ids.data(), to, serr))
                         std::fprintf(stderr, "strata serve: the earlier stage kept no checkpoint at %lld: %s\n",
