@@ -13736,8 +13736,8 @@ int main(int argc, char** argv) {
                     }
                     slot_delta_base[(size_t) slot] = {};   // deltas are not cut from a split: the next save is whole
                     std::fprintf(stderr, "strata serve: layer-split session of slot %d saved: %zu tokens, %zu stages, %zu bytes to %s\n",
-                                 slot, bs[(size_t) slot].ids.size(), stages.size() + 1, bytes, path.c_str());
-                    std::printf("SAVED %zu %zu %.1f\n", bs[(size_t) slot].ids.size(), bytes, ms());
+                                 slot, image.live.ids.size(), stages.size() + 1, bytes, path.c_str());
+                    std::printf("SAVED %zu %zu %.1f\n", image.live.ids.size(), bytes, ms());
                 } else if (save && slot >= 0) {
                     if (bslot_ss.empty() || slot >= (int) bs.size() || bs[(size_t) slot].active ||
                         bs[(size_t) slot].ids.empty() || bs[(size_t) slot].img) {
