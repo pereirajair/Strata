@@ -68,6 +68,13 @@ int main() {
     check((joined.live.gdn == bytes({1, 2, 2, 3})), "running state: the stages' rows, in layer order");
     check((joined.live.tails == bytes({3, 4})), "tails: the stages' blocks, in layer order");
     check((joined.live.ple == bytes({0xEE})), "ple: the one stage that holds the history");
+    {   // the stages' copies of the shared history are the same: one is kept
+        auto same_ple = split;
+        same_ple[1].live.ple = bytes({0xEE});
+        SavedConversation both;
+        check(conversation_merge_stages(same_ple, both, error) && both.live.ple == bytes({0xEE}),
+              "equal ple copies join, one is kept");
+    }
     check((joined.live.ids == split[0].live.ids && joined.live.used == 5), "tokens and the clock come from the chain");
     check(joined.checkpoints.size() == 1, "one checkpoint in the chain");
     check(joined.checkpoints[0].gdn == bytes({1, 2}) && joined.checkpoints[0].tails == bytes({1, 2}),
@@ -103,7 +110,7 @@ int main() {
     {
         auto s = split;
         s[1].live.ple = bytes({0xEF});
-        refused(s, "two stages with a ple history are refused");
+        refused(s, "two different ple histories are refused");
     }
     {
         auto s = split;
