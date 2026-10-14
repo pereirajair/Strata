@@ -8,18 +8,22 @@ namespace {
 
 // The bytes of one recurrent block, joined across stages: stages in order, and at most one of them may hold it.
 bool join_blocks(const std::vector<const std::vector<uint8_t>*>& parts, std::vector<uint8_t>& out, const char* what,
-                 bool one_holder, std::string& error) {
-    size_t holders = 0;
+                 bool shared, std::string& error) {
     out.clear();
-    for (const auto* part : parts) {
-        if (part->empty()) continue;
-        ++holders;
-        out.insert(out.end(), part->begin(), part->end());
+    if (shared) {
+        // a history every stage holds a copy of (ple): the copies must be the same, and one is kept
+        for (const auto* part : parts) {
+            if (part->empty()) continue;
+            if (out.empty()) {
+                out = *part;
+            } else if (*part != out) {
+                error = std::string("topology: the stages hold different copies of the ") + what;
+                return false;
+            }
+        }
+        return true;
     }
-    if (one_holder && holders > 1) {
-        error = std::string("topology: more than one stage holds the ") + what;
-        return false;
-    }
+    for (const auto* part : parts) out.insert(out.end(), part->begin(), part->end());
     return true;
 }
 
