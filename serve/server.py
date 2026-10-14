@@ -736,6 +736,8 @@ FATAL_PREFIXES = ("ERR verify: timed out at layer ", "ERR verify batch: timed ou
 
 
 class StrataEngine:
+    probe_request = None      # the decision probe's label groups (token ids) for the next request, or None
+    last_probe = None         # that request's PROBE_RESULT: {"probabilities": [...], "mass": x}, once answered
     """The resident engine: `strata --serve` reads `GEN <max_new> <ids>` lines and streams `T <id>` lines, then
     `DONE ...`.  Requests are serialized by the service's FIFO, so one pipe is enough.
 
@@ -1213,6 +1215,14 @@ class StrataEngine:
         except (OSError, AttributeError):                # the pipe is gone (or a restart's close() took the process):
             raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
 
+    def _send_probe(self):
+        """A decision probe goes just before the GEN / BGEN it belongs to, until its PROBE_RESULT has answered: the
+        engine reads it on the request's first window (`probe_request`: one list of token ids per label)."""
+        groups = self.probe_request
+        if groups is None or self.last_probe is not None:
+            return
+        self._send("PROBE " + ";".join(",".join(str(int(t)) for t in group) for group in groups))
+
     def _control(self, cancel, on_token, stop_when=None, on_quiet=None):
         """Reads the control lines of the request on them (GEN / BGEN), yielding None heartbeats.  Calls on_token(id)
         for each `T`; returns ("done", None) at DONE, or ("badm", continues) at BADM (after DONE).  `stop_when()`
@@ -1269,6 +1279,11 @@ class StrataEngine:
                 f = line.split()
                 if len(f) >= 3 and f[1].lstrip("-").isdigit() and f[2].isdigit():
                     self._yielded = (int(f[1]), int(f[2]))
+            elif line.startswith("PROBE_RESULT "):      # a decision probe's label distribution (PROBE before the GEN)
+                f = line.split()
+                if len(f) >= 3 and f[1].isdigit() and len(f) == int(f[1]) + 3:
+                    self.last_probe = {"probabilities": [float(x) for x in f[2:2 + int(f[1])]],
+                                       "mass": float(f[-1])}
             elif line.startswith("ERR"):
                 self._ctl_erred = True                   # #1059: the engine refused it and is idle: no DONE follows
                 raise ValueError(line[4:].strip())
@@ -1538,6 +1553,7 @@ class StrataEngine:
                 if alone and left > 1:
                     head = f"GENI {left}{keys} {embeddings}" if embeddings else f"GEN {left}{keys}"
                     self._last_done = None                  # (#879: this request's DONE decides below)
+                    self._send_probe()
                     self._send(f"{head} {','.join(str(int(t)) for t in prompt)}")
                     phase = "solo"
                     self._ctl_mode, self._ctl_result, self._yielded = "solo", None, None
@@ -1653,6 +1669,7 @@ class StrataEngine:
                             "started": time.time(), "first_token": None}
                     self.slot_live[slot] = live
                     self._last_done = None                  # (#879: this admission's DONE decides below)
+                    self._send_probe()
                     self._send(f"{head} {','.join(str(int(t)) for t in prompt)}")
                     self.slot_held[slot] = []               # the admission overwrites what the slot held
                     phase = "admit"
