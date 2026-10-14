@@ -11244,6 +11244,12 @@ int main(int argc, char** argv) {
                         refuse(err, st.error, st.published);
                         continue;
                     }
+                    {   // [diag] the slot's token list against the conversation
+                        const auto& ids_v = bs[(size_t) slot].ids;
+                        std::fprintf(stderr, "[diag] split save slot %d: ids=%zu checks=%zu last=", slot, ids_v.size(), bs[(size_t) slot].checks.size());
+                        for (size_t q = ids_v.size() > 6 ? ids_v.size() - 6 : 0; q < ids_v.size(); ++q) std::fprintf(stderr, " %d", (int) ids_v[q]);
+                        std::fprintf(stderr, "\n");
+                    }
                     slot_delta_base[(size_t) slot] = {};   // deltas are not cut from a split: the next save is whole
                     std::fprintf(stderr, "strata serve: layer-split session of slot %d saved: %zu tokens, %zu stages, %zu bytes to %s\n",
                                  slot, bs[(size_t) slot].ids.size(), stages.size() + 1, bytes, path.c_str());
