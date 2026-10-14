@@ -2529,7 +2529,8 @@ class StrataEngine:
             if action.startswith("restore"):
                 self.slot_held[slot] = list(ids)
             else:
-                result["ids"] = list(self.slot_held[slot])
+                # the image holds the first `tokens` of the slot's tokens: the turn boundary, when the engine saved one
+                result["ids"] = list(self.slot_held[slot][:int(result.get("tokens") or 0)])
             self.slot_used[slot] = time.time()
             return result
         finally:
