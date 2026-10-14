@@ -110,6 +110,10 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
                                 ConversationKvReuse reuse = {}, size_t* reused_bytes = nullptr);
 bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& session,
                                     const ModelGeometry& g, const QsaState* draft, std::string& error);
+// The image of a conversation at checkpoint `ck` (its running state and the K/V up to its length; no device state).
+bool conversation_snapshot_from_checkpoint(SavedConversation& image, const ConversationCheckpoint& ck, bool cvec,
+                                           const SessionState& session, const ModelGeometry& g, const QsaState* draft,
+                                           std::string& error);
 ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& session,
                                                    const ModelGeometry& g, const QsaState* draft, std::string& error);
 

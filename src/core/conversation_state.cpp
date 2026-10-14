@@ -296,6 +296,29 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
     return true;
 }
 
+// The image of a conversation at a checkpoint: its running state is the checkpoint's own (not the device's, which is
+// where the session is now), its K/V is the cells up to its length (positional, so they are the same at that length).
+// No other checkpoint is written: the state is in the file once.
+bool conversation_snapshot_from_checkpoint(SavedConversation& image, const ConversationCheckpoint& ck, bool cvec,
+                                           const SessionState& ss, const ModelGeometry& g, const QsaState* draft,
+                                           std::string& error) {
+    if (!sync(error)) return false;
+    SavedConversation captured;
+    captured.geometry = geometry_key(g);
+    captured.layer_lo = ss.layer_lo; captured.layer_hi = ss.layer_hi;
+    captured.live = ck;
+    captured.live.stage_parts.clear();
+    captured.cvec = cvec;
+    const size_t layers = owned_qsa(ss);
+    captured.kv.resize(layers + (draft ? 1 : 0));
+    const int64_t upto = (int64_t) ck.ids.size();
+    for (size_t j = 0; j < layers; ++j)
+        if (!conversation_kv_save(captured.kv[j], owned(ss, j), g, upto, true, error)) return false;
+    if (draft && !conversation_kv_save(captured.kv.back(), *draft, g, upto, false, error)) return false;
+    image = std::move(captured);
+    return true;
+}
+
 bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionKvSource>& sources,
                                    const ConversationView& view, const SessionState& ss, const ModelGeometry& g,
                                    const QsaState& draft, std::string& error) {

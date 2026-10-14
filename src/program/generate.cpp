@@ -11211,24 +11211,40 @@ int main(int argc, char** argv) {
                 auto slot_image = [&](int b, strata::core::SavedConversation& image, std::string& e) -> bool {
                     BSlot& sl = bs[(size_t) b];
                     const size_t n_st = stages.size();
-                    // a turn boundary of this conversation (sl.turn_len): the image is that checkpoint, the tokens are its own
-                    std::vector<ConvCheckpoint> copy = sl.checks;
-                    std::vector<int32_t> live = sl.ids;
                     if (sl.turn_len > 0) {
-                        auto at = std::find_if(copy.begin(), copy.end(), [&](const ConvCheckpoint& c) {
+                        // the turn boundary: every GPU's image is that checkpoint's own state (the device holds the end of
+                        // the turn, so it is not used here)
+                        auto at = std::find_if(sl.checks.begin(), sl.checks.end(), [&](const ConvCheckpoint& c) {
                             return (int64_t) c.ids.size() == sl.turn_len; });
-                        if (at == copy.end()) { e = "the turn boundary's checkpoint is gone"; return false; }
-                        copy = {*at};
-                        live.assign(at->ids.begin(), at->ids.end());
+                        if (at == sl.checks.end() || at->stage_parts.size() != n_st) {
+                            e = "the turn boundary's checkpoint is gone";
+                            return false;
+                        }
+                        if (!strata::core::conversation_snapshot_from_checkpoint(image, *at, true, *bslot_ss[0][(size_t) b], g,
+                                                                                 split_draft(0), e))
+                            return false;
+                        for (size_t k = 0; k < n_st; ++k) {
+                            const strata::core::OnDevice on(stages[k]->dev);
+                            if (cudaDeviceSynchronize() != cudaSuccess) { e = "stage sync failed"; return false; }
+                            strata::core::SavedConversation part;
+                            if (!strata::core::conversation_snapshot_from_checkpoint(part, at->stage_parts[k], true,
+                                                                                     *bslot_ss[k + 1][(size_t) b], g,
+                                                                                     split_draft(k + 1), e))
+                                return false;
+                            image.stage_images.push_back(std::move(part));
+                        }
+                        return true;
                     }
+                    // no boundary: the slot's whole state, as the device holds it
+                    std::vector<ConvCheckpoint> copy = sl.checks;
                     auto cs = strata::core::conversation_checkpoints_split(std::move(copy), n_st);
-                    const strata::core::ConversationView v0{live, std::vector<ImgKey>{}, cs.stage0, true};
+                    const strata::core::ConversationView v0{sl.ids, std::vector<ImgKey>{}, cs.stage0, true};
                     if (!strata::core::conversation_snapshot_save(image, v0, *bslot_ss[0][(size_t) b], g, split_draft(0), e))
                         return false;
                     for (size_t k = 0; k < n_st; ++k) {
                         const strata::core::OnDevice on(stages[k]->dev);
                         if (cudaDeviceSynchronize() != cudaSuccess) { e = "stage sync failed"; return false; }
-                        const strata::core::ConversationView vk{live, std::vector<ImgKey>{}, cs.parts[k], true};
+                        const strata::core::ConversationView vk{sl.ids, std::vector<ImgKey>{}, cs.parts[k], true};
                         strata::core::SavedConversation part;
                         if (!strata::core::conversation_snapshot_save(part, vk, *bslot_ss[k + 1][(size_t) b], g,
                                                                       split_draft(k + 1), e))
