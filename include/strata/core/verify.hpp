@@ -261,6 +261,12 @@ public:
     bool window_logprobs(const int32_t* targets, int T, int64_t pos0, int32_t extra_id, std::FILE* out,
                          std::string& err);
 
+    /// Decision probe: after run(), the probability of each label of `groups` (the token ids of one label) in row
+    /// `row` of the last window's head - the softmax over the whole vocabulary, summed over the label's ids - and
+    /// their total in `mass`.  A layer split's earlier stage forwards to the stage that holds the head.
+    bool row_label_probs(int row, const std::vector<std::vector<int32_t>>& groups, std::vector<double>& probs,
+                         double& mass, std::string& err);
+
     /// Token t's residual after the last layer, (hc, n_embd) on the device, valid until the next `run`.
     const float* final_R(int t) const;
     const float* final_R_all() const { return next_ ? next_->final_R_all() : R_; }
