@@ -1093,6 +1093,20 @@ class ToolCallRecovery(unittest.TestCase):
         text = "<tool_call>\n<parameter=path>\na.md\n</parameter>\n</function>\n</tool_call>"
         self.check(text, [], text)
 
+    def test_parameter_calls_wrapper_with_named_parameters(self):
+        # the near form with `<parameter name="...">` for the invoke and for each parameter, and `<parameter_calls>`
+        # as the wrapper: the same call as the template's form
+        text = ('<parameter_calls>\n<parameter name="write">\n<parameter name="path">\na.md\n</parameter>\n'
+                '<parameter name="content">\nhi\n</parameter>\n</function>\n</parameter_calls>')
+        self.check(text, [("write", self.CALL)], "")
+        self.check("<parameter_calls>\n<parameter name=\"write\">\n<parameter name=\"path\">\na.md\n</parameter>\n"
+                   "<parameter name=\"content\">\nhi\n</parameter>\n</function>\n</tool_call>", [("write", self.CALL)], "")
+
+    def test_unknown_tool_in_the_near_form_is_content(self):
+        text = ('<parameter_calls>\n<parameter name="format_disk">\n<parameter name="path">\na.md\n</parameter>\n'
+                '</function>\n</parameter_calls>')
+        self.check(text, [], text)
+
     def test_json_in_the_wrapper(self):
         # corpus 5e847539 (x6): the JSON form inside the XML wrapper
         for key in ("arguments", "parameters"):
