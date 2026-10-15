@@ -96,6 +96,22 @@ std::vector<fixture::Kv> with(std::vector<fixture::Kv> kv, const std::string& ke
     return kv;
 }
 
+/// The metadata POM writes for a layer slice: block_count and per-layer arrays are local to the file, while
+/// pom.original_block_count lets GgufFile expose the whole model's geometry and absolute layer numbers.
+std::vector<fixture::Kv> pom_slice_keys(int64_t start, std::vector<uint64_t> compress_ratios) {
+    const int64_t end = start + (int64_t) compress_ratios.size() - 1;
+    const std::string p = "qwen4exp.";
+    const fixture::Kv block_count = fixture::u32(p + "block_count", compress_ratios.size());
+    const fixture::Kv ratios_key = fixture::u32s(p + "attention.compress_ratios", std::move(compress_ratios));
+    const fixture::Kv begin_key = fixture::u32("pom.start_layer", start);
+    const fixture::Kv end_key = fixture::u32("pom.end_layer", end);
+    const fixture::Kv original_key = fixture::u32("pom.original_block_count", 48);
+    return with(with(with(with(with(full_keys(), block_count.key, &block_count), ratios_key.key, &ratios_key),
+                          begin_key.key, &begin_key),
+                     end_key.key, &end_key),
+                original_key.key, &original_key);
+}
+
 struct Result {
     std::string read_err, unsupported, guard;
     ModelGeometry g;
@@ -238,6 +254,29 @@ int main(int argc, char** argv) {
         const fixture::Kv fl = fixture::f32(p + "block_count", 48.0f);
         check(has(run(d.path, with(full_keys(), fl.key, &fl)).read_err, "is not an integer"),
               "a float where a count belongs is refused");
+    }
+    {
+        // POM shortens per-layer metadata arrays to a slice's local layers.  GgufFile restores block_count to the
+        // original 48 and renumbers tensors, so geometry must validate those entries at their absolute offset.
+        const Result r = run(d.path, pom_slice_keys(1, {0, 0, 4, 0}));
+        check(r.read_err.empty() && r.g.n_layers == 48 && r.g.idx_block == 4 && r.guard.empty(),
+              "a POM slice reads its four local compress_ratios at absolute layers 1..4" +
+                  (r.read_err.empty() ? "" : ": " + r.read_err));
+
+        const fixture::Kv whole = fixture::u32s(p + "attention.compress_ratios", ratios(48, 4, 4));
+        const Result old = run(d.path, with(pom_slice_keys(1, {0, 0, 4, 0}), whole.key, &whole));
+        check(old.read_err.empty() && old.guard.empty(),
+              "a POM slice carrying the whole array remains compatible");
+
+        const fixture::Kv short_ratios = fixture::u32s(p + "attention.compress_ratios", {0, 0, 4});
+        const Result short_slice =
+            run(d.path, with(pom_slice_keys(1, {0, 0, 4, 0}), short_ratios.key, &short_ratios));
+        check(has(short_slice.read_err, "4 layers in this POM slice"),
+              "a POM slice with too few local ratios is refused: " + short_slice.read_err);
+
+        const Result shifted_slice = run(d.path, pom_slice_keys(1, {0, 4, 0, 0}));
+        check(has(shifted_slice.read_err, "compress_ratios[1] = 4") && has(shifted_slice.read_err, "layer 2"),
+              "a POM slice's bad local ratio names its array entry and absolute layer");
     }
     {
         // a consistent file of another shape reads, and the kernels refuse it naming the key
