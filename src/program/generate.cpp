@@ -11125,7 +11125,7 @@ int main(int argc, char** argv) {
                     // The save of one conversation (the live state, its checkpoints, the K/V streamed to the file - whole,
                     // or as a delta). A refusal is answered inside; false means one was.
                     auto save_session = [&](strata::core::SessionState& ss, const std::vector<int32_t>& live,
-                                            const std::vector<ImgKey>& live_imgs, const std::vector<ConvCheckpoint>& checks,
+                                            const std::vector<ImgKey>& live_imgs, std::vector<ConvCheckpoint>& checks,
                                             bool cvec_cached, const auto& draft, DeltaBase& delta_base) -> bool {
                     size_t bytes = 0, kept = 0;
                     double capture_ms = 0;
@@ -11349,7 +11349,7 @@ int main(int argc, char** argv) {
                         limits.progress = moving;
                         const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
                         limits.admit = [floor, &o](uint64_t need, std::string& why) {
-                            const auto avail = strata::core::conversation_available_memory();
+                            const auto avail = strata::core::available_host_bytes();
                             if (strata::core::conversation_memory_admit(avail, need, floor)) return true;
                             why = "not enough RAM to read it (" + std::to_string(need >> 20) + " MiB plus a floor of " +
                                   std::to_string((long long) o.conversation_cache_min_free_mib) + " MiB needed, " +
