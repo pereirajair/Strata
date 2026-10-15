@@ -750,16 +750,30 @@ inline std::string read_geometry(const GgufFile& f, core::ModelGeometry& g) {
         return p + "rope.dimension_count = " + std::to_string(g.n_rot) + " is not an even slice of the head widths";
 
     // The layer split, twice over: the interval, and a ratio per layer that is non-zero (the indexer's pooling
-    // block) exactly on the full-attention layers.
+    // block) exactly on the full-attention layers.  A POM layer slice carries only its local part of every per-layer
+    // metadata array, while GgufFile exposes block_count as the whole model's (and renumbers its tensors to their
+    // absolute layers).  Read that local array at the same absolute offset.  Also accept a whole-model array in a
+    // slice for compatibility with slices made before POM shortened per-layer metadata.
     if (const MetaValue* v = f.get(p + "attention.compress_ratios")) {
-        if (v->type != MetaType::ARRAY || v->count != (uint64_t) g.n_layers || v->items.size() != v->count)
+        const bool sliced = f.slice_begin() >= 0;
+        const int64_t local_layers = sliced ? f.slice_end() - f.slice_begin() + 1 : g.n_layers;
+        int64_t first_layer = 0;
+        const bool local_array = sliced && v->count == (uint64_t) local_layers;
+        const bool whole_array = v->count == (uint64_t) g.n_layers;
+        if (v->type != MetaType::ARRAY || (!local_array && !whole_array) || v->items.size() != v->count) {
+            if (sliced)
+                return p + "attention.compress_ratios must list either the " + std::to_string(local_layers) +
+                       " layers in this POM slice or all " + std::to_string(g.n_layers) + " layers";
             return p + "attention.compress_ratios must list one entry for each of the " + std::to_string(g.n_layers) +
                    " layers";
+        }
+        if (local_array) first_layer = f.slice_begin();
         int64_t block = 0;
-        for (int64_t l = 0; l < g.n_layers; ++l) {
-            const int64_t r = (int64_t) v->items[(size_t) l].u;
+        for (size_t i = 0; i < v->items.size(); ++i) {
+            const int64_t l = first_layer + (int64_t) i;
+            const int64_t r = (int64_t) v->items[i].u;
             if ((r != 0) != core::is_qsa_layer(g, l) || r < 0 || (block && r && r != block))
-                return p + "attention.compress_ratios[" + std::to_string(l) + "] = " + std::to_string(r) +
+                return p + "attention.compress_ratios[" + std::to_string(i) + "] = " + std::to_string(r) +
                        ", but full_attention_interval = " + std::to_string(g.qsa_interval) + " makes layer " +
                        std::to_string(l) + (core::is_qsa_layer(g, l) ? " full attention" : " linear attention") +
                        (block && r ? " (and the other full-attention layers pool " + std::to_string(block) + ")" : "");
