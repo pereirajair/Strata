@@ -822,6 +822,9 @@ struct Options {
     /// --serve SAVE: disk space a session file must leave free where it is written (MiB; 0 = no check)
     int64_t session_min_free_mib = 4096;
     bool session_save_reclaim = false;
+    /// --serve SAVE of a layer split's slot: answer SAVING once the state is in RAM and write the file on a thread
+    /// (SAVED / SERR when it is written); off, the answer is SAVED when the file is written
+    bool session_async_save = false;
     /// --serve: also keep a checkpoint every N freshly read prompt tokens (0 = only at the last turn boundary)
     int64_t prompt_cache_every = 16384;
     bool prompt_cache_tail = false;   // optional extra checkpoint at an existing near-tail chunk boundary
@@ -2698,6 +2701,8 @@ static double ple_direct_rows_per_s(strata::kernels::PleTable& t) {
     }
     return el > 0 ? (double) done / el : -1.0;
 }
+// The layer ranges of a layer split (INFO layers=...), empty on a whole model.
+static std::string g_layer_ranges;
 
 #if defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
 // The R9700 / RX 9000 "bimodal prompt speed" (0.2.0 known limit).  The runtime opens the process's hardware queues
@@ -3201,6 +3206,7 @@ int main(int argc, char** argv) {
             else if (a == "--memory-limit-mib") o.memory_limit_mib = number;
             else o.conversation_cache_slots = (int) number;
         }
+        else if (a == "--session-async-save") o.session_async_save = true;
         else if (a == "--prompt-cache-tail") o.prompt_cache_tail = true;
         else if (a == "--prompt-cache-spread") o.prompt_cache_spread = true;
         else if (a == "--prompt-cache-every") o.prompt_cache_every = std::max(0LL, std::atoll(next("--prompt-cache-every")));
@@ -10027,6 +10033,11 @@ int main(int argc, char** argv) {
                           " (CUDA" + std::to_string(split_same ? 0 : stages[(size_t) st - 1]->dev) + ")";
             std::fprintf(stderr, "strata serve: layer split: layers %s, one hand-off per window%s\n", plan_s.c_str(),
                          overlap ? " (overlapped: STRATA_SPLIT_OVERLAP=1)" : "");
+            // the layer ranges alone (no GPU names): a session file is only usable on a machine with the same split
+            g_layer_ranges = "0-" + std::to_string(split_at[0] - 1);
+            for (int st = 1; st < n_stages; ++st)
+                g_layer_ranges += "|" + std::to_string(split_at[(size_t) st - 1]) + "-" +
+                                  std::to_string(split_drive.end[st] - 1);
         }
         // --pipeline-windows: the odd windows' verifiers and their hand-off (initialized before `ver`, which stays the
         // watchdog's verifier), and the drafter's own row buffer, which either parity's rows are copied into
@@ -12253,6 +12264,7 @@ int main(int argc, char** argv) {
         // the batch slots as they are at READY (the INFO line above is printed before the batch is fitted): the
         // bridge reads them to decide whether a turn can be saved in a slot (INFO batch_slots=N)
         std::printf("INFO batch_slots=%d\n", o.batch);
+        if (!g_layer_ranges.empty()) std::printf("INFO layers=%s\n", g_layer_ranges.c_str());   // the bridge's session check
         std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
         std::fflush(stdout);
         std::string line;
@@ -13341,6 +13353,14 @@ int main(int argc, char** argv) {
                 if (!pump(false)) return false;
             return pmtp_settle();
         };
+        // A layer split's SAVE: the slot's state is copied to RAM (SAVING answers), then the file is written here on a
+        // thread while the slots run. One writer at a time: the next session command waits for it, and the process
+        // does not end under it (the destructor joins it).
+        struct AsyncSave {
+            std::thread t;
+            ~AsyncSave() { if (t.joinable()) t.join(); }
+            void wait() { if (t.joinable()) t.join(); }
+        } async_save;
         for (;;) {
             line_drain_ms = 0.0;
             if (batch_on() || (piped && pipe_inflight())) {
@@ -13463,6 +13483,7 @@ int main(int argc, char** argv) {
             // (A verifier commit that fails before the command still answers ERR and exits, as for a request.)
             const bool delta_cmd = line.rfind("SAVE_DELTA ", 0) == 0 || line.rfind("RESTORE_DELTA ", 0) == 0;
             if (line.rfind("SAVE ", 0) == 0 || line.rfind("RESTORE ", 0) == 0 || delta_cmd) {
+                async_save.wait();                  // a session file still being written (SAVING, then SAVED) goes first
                 const bool save = line[0] == 'S';
                 const bool delta = delta_cmd;
                 std::string path = line.substr(save ? (delta ? 11 : 5) : (delta ? 14 : 8));
@@ -13727,20 +13748,54 @@ int main(int argc, char** argv) {
                     strata::core::SavedConversation image;
                     std::string e;
                     if (!slot_image(slot, image, e)) { refuse(e, strata::core::SessionError::memory); continue; }
-                    strata::core::SessionWriteOptions wo;
-                    wo.min_free_bytes = (uint64_t) o.session_min_free_mib << 20;
-                    wo.progress = moving;
-                    wo.phase = blocking;
-                    strata::core::SessionStatus st;
-                    size_t bytes = 0;
-                    if (!strata::core::session_file_write(path, image, id, bytes, err, wo, &st)) {
-                        refuse(err, st.error, st.published);
+                    // the state is in RAM now: the slot is free, and the file is written on a thread (the file writer
+                    // reads host memory only). SAVING says the copy is done; SAVED (or SERR) comes when the file is.
+                    slot_delta_base[(size_t) slot] = {};   // deltas are not cut from a split: the next save is whole
+                    const size_t tokens = image.live.ids.size(), stage_count = stages.size() + 1;
+                    const uint64_t min_free = (uint64_t) o.session_min_free_mib << 20;
+                    if (!o.session_async_save) {
+                        // the default: the file is written before the answer, as before (SAVED with the write's numbers)
+                        strata::core::SessionWriteOptions wo;
+                        wo.min_free_bytes = min_free;
+                        wo.progress = moving;
+                        wo.phase = blocking;
+                        strata::core::SessionStatus st;
+                        size_t bytes = 0;
+                        if (!strata::core::session_file_write(path, image, id, bytes, err, wo, &st)) {
+                            refuse(err, st.error, st.published);
+                            continue;
+                        }
+                        std::fprintf(stderr, "strata serve: layer-split session of slot %d saved: %zu tokens, %zu stages, %zu bytes to %s\n",
+                                     slot, tokens, stage_count, bytes, path.c_str());
+                        std::printf("SAVED %zu %zu %.1f\n", tokens, bytes, ms());
                         continue;
                     }
-                    slot_delta_base[(size_t) slot] = {};   // deltas are not cut from a split: the next save is whole
-                    std::fprintf(stderr, "strata serve: layer-split session of slot %d saved: %zu tokens, %zu stages, %zu bytes to %s\n",
-                                 slot, image.live.ids.size(), stages.size() + 1, bytes, path.c_str());
-                    std::printf("SAVED %zu %zu %.1f\n", image.live.ids.size(), bytes, ms());
+                    std::printf("SAVING %zu %.1f\n", tokens, ms());
+                    std::fflush(stdout);
+                    auto pending = std::make_shared<strata::core::SavedConversation>(std::move(image));
+                    async_save.t = std::thread([pending, path, id, min_free, slot, tokens, stage_count]() {
+                        const auto t1 = Clock::now();
+                        strata::core::SessionWriteOptions wo;   // no progress or phase lines: they would reach the next request
+                        wo.min_free_bytes = min_free;
+                        strata::core::SessionStatus st;
+                        size_t bytes = 0;
+                        std::string werr;
+                        if (!strata::core::session_file_write(path, *pending, id, bytes, werr, wo, &st)) {
+                            std::fprintf(stderr, "strata serve: session save %s: %s\n", path.c_str(), werr.c_str());
+                            std::string one = werr;   // one protocol line
+                            for (char& c : one) if (c == '\n' || c == '\r') c = ' ';
+                            std::printf("SERR %s %d %s\n", strata::core::session_error_name(st.error), st.published ? 1 : 0,
+                                        one.c_str());
+                            std::fflush(stdout);
+                            return;
+                        }
+                        const double write_ms = std::chrono::duration<double, std::milli>(Clock::now() - t1).count();
+                        std::fprintf(stderr, "strata serve: layer-split session of slot %d saved: %zu tokens, %zu stages, %zu bytes to %s (written in %.0f ms)\n",
+                                     slot, tokens, stage_count, bytes, path.c_str(), write_ms);
+                        std::printf("SAVED %zu %zu %.1f\n", tokens, bytes, write_ms);
+                        std::fflush(stdout);
+                    });
+                    continue;
                 } else if (save && slot >= 0) {
                     if (bslot_ss.empty() || slot >= (int) bs.size() || bs[(size_t) slot].active ||
                         bs[(size_t) slot].ids.empty() || bs[(size_t) slot].img) {
