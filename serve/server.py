@@ -286,6 +286,8 @@ ENGINE_SILENCE_S = 300.0
 # Disk sessions: the longest allowance an engine may announce (`SWAIT <phase> <s>`) for one step that blocks in a
 # single call (a file flush, the host->device transfer); the engine's own bound is the same (session_phase_limit_s).
 SESSION_WAIT_MAX_S = 3600
+# the engine's session answers: they go to the session queue, not to the generation lines (see _pump)
+SESSION_REPLIES = ("SAVING ", "SAVED ", "SERR ", "RESTORED ", "SESSION ", "SWAIT ")
 # ... except while a prompt is read: a PP line comes once per chunk (up to 32768 tokens with --prefill auto, issue
 # #282), and the slowest PCs read ~100 tok/s, so a first chunk can take minutes before the first line.  Until the first
 # PP the wait adds the chunk's tokens at PP_FLOOR_TOK_S; after one, a chunk may take PP_SLACK x the last one's time.
@@ -1140,6 +1142,10 @@ class StrataEngine:
         self.ended = False                              # READY: alive from here (restart() set it True, #344)
         # the engine's stdout on a thread, so a request can wait with a timeout (heartbeats, cancel checks)
         self.lines: queue.Queue = queue.Queue()
+        # the session replies (SAVING, SAVED, SERR, RESTORED, SESSION, SWAIT): their own queue, so a request reading the
+        # generation lines never meets a save that is still being written (see _pump, await_session_file)
+        self.save_q: queue.Queue = queue.Queue()
+        self.save_pending: dict | None = None           # the SAVE answered SAVING, its SAVED not read yet
         # --batch: concurrent requests in the engine's batch slots (see generate_batched).  The engine says how many
         # it runs (INFO batch_slots=N: it may have fewer than asked, or none, when they do not fit)
         asked = next((int(args[args.index(k) + 1]) for k in ("--batch", "--slots") if k in args), 0)
@@ -1194,10 +1200,13 @@ class StrataEngine:
         self.pump.start()
 
     def _pump(self):
-        proc, lines = self.proc, self.lines             # this process's: a restart replaces both (#344)
+        proc, lines, save_q = self.proc, self.lines, self.save_q   # this process's: a restart replaces them (#344)
         slot_q = self.slot_q
         line = None
         for line in proc.stdout:
+            if line.startswith(SESSION_REPLIES):        # a session's answers: read by its own waiter, never a request
+                save_q.put(line)
+                continue
             # checked before batch routing: a fatal line is never a slot's own
             if line.startswith(FATAL_PREFIXES):
                 # release_gpu_waits invalidates the verifier, even if the native
@@ -1232,6 +1241,7 @@ class StrataEngine:
             if line and line.startswith("ERR"):         # #997 #890: why it exited, though no request may read it
                 self.last_err = line[4:].strip()        # (a failed batch window: every request reads its slot)
         lines.put(None)
+        save_q.put(None)
         for q in slot_q:
             q.put(None)
 
@@ -2511,6 +2521,7 @@ class StrataEngine:
         It needs every slot idle (the engine runs nothing else meanwhile), and the slot is busy while it moves.  A save
         returns the tokens the slot holds (`ids`); a restore sets them, as the slot's held tokens for the next turn
         (`ids` is required).  A failed restore leaves the slot holding nothing: its state is no longer known."""
+        self._settle_pending()                          # an earlier save's SAVED is read first: it is in the same queue
         if slot is None:
             return self._session_round(action, path, None)
         if not getattr(self, "batch", 0) or not 0 <= int(slot) < self.batch:
@@ -2526,6 +2537,9 @@ class StrataEngine:
         try:
             try:
                 result = self._session_round(action, path, slot)
+                if result.get("pending"):               # SAVING: the caller awaits the file with await_session_file
+                    ticket = {"path": path, "slot": slot, "result": None, "error": None, "done": False}
+                    self.save_pending = result["pending"] = ticket
             except Exception:
                 if action.startswith("restore"):
                     self.slot_held[slot] = []
@@ -2542,7 +2556,29 @@ class StrataEngine:
                 self.slot_busy[slot] = was_busy
                 self.slot_cv.notify_all()
 
-    def _session_round(self, action: str, path: str, slot: int | None) -> dict:
+    def _settle_pending(self) -> None:
+        """Reads the SAVED (or SERR) of an earlier save answered SAVING, before anything else goes to the engine. Its
+        error stays on its ticket: the caller that asked for that save gets it."""
+        ticket = self.save_pending
+        if ticket is not None:
+            self.await_session_file(ticket, raise_error=False)
+
+    def await_session_file(self, ticket: dict, raise_error: bool = True) -> dict:
+        """The file of a save answered SAVING: waits for its SAVED (or SERR). While it waits the engine runs requests;
+        the state the save copied is already in RAM. -> the SAVED numbers; SessionRefused / EngineDied on failure."""
+        if not ticket["done"]:
+            try:
+                ticket["result"] = self._session_round("save", ticket["path"], ticket["slot"], await_only=True)
+            except Exception as e:                      # kept on the ticket: its caller reads it, not the next request
+                ticket["error"] = e
+            ticket["done"] = True
+            if self.save_pending is ticket:
+                self.save_pending = None
+        if ticket["error"] is not None and raise_error:
+            raise ticket["error"]
+        return ticket["result"]
+
+    def _session_round(self, action: str, path: str, slot: int | None, await_only: bool = False) -> dict:
         """Disk sessions: `SAVE <path>` / `RESTORE <path>` between requests (the caller holds the service FIFO).
         -> {"tokens", "bytes", "ms"}.  SessionRefused (kind, published) when the engine refused or failed the file and
         is still in step (`SERR <kind> <0|1> <reason>`).  Any line this exchange does not allow - an unknown or
@@ -2559,15 +2595,18 @@ class StrataEngine:
         # the engine's command word, and the answer it prints: a delta is answered like a whole session
         word = {"save": "SAVE", "restore": "RESTORE", "save_delta": "SAVE_DELTA", "restore_delta": "RESTORE_DELTA"}[action]
         save = action in ("save", "save_delta")
-        try:
-            target = f"{word} @{slot} {path}" if slot is not None else f"{word} {path}"
-            self.proc.stdin.write(target + "\n")
-            self.proc.stdin.flush()
-        except OSError:
-            raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
+        if not await_only:                              # await_only: the command went out before (await_session_file)
+            try:
+                target = f"{word} @{slot} {path}" if slot is not None else f"{word} {path}"
+                self.proc.stdin.write(target + "\n")
+                self.proc.stdin.flush()
+            except OSError:
+                raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
         silence = float(self.silence_s or 0)
         heard = time.monotonic()
         want = "SAVED" if save else "RESTORED"
+        # SAVING: a layer split's save answered once its state is in RAM, the file written on the engine's thread
+        pending_ok = save and not await_only
 
         def out_of_step(line: str) -> EngineDied:
             self.ended = True                               # not alive from now: the next request restarts it
@@ -2592,7 +2631,7 @@ class StrataEngine:
             try:
                 if left is not None and left <= 0:
                     raise queue.Empty
-                line = self.lines.get(timeout=left)
+                line = self.save_q.get(timeout=left)
             except queue.Empty:
                 raise self._silent(f"the engine said nothing for {limit:.0f} s during a session {action}"
                                    + (f" (in a blocking step allowed {allow:.0f} s)" if allow > silence else "")) from None
@@ -2630,6 +2669,16 @@ class StrataEngine:
                 if len(parts) != 4 or parts[1] not in SessionRefused.STATUS or parts[2] not in ("0", "1"):
                     raise out_of_step(line)
                 raise SessionRefused(parts[1], parts[3].strip(), parts[2] == "1")
+            if pending_ok and head == "SAVING":
+                try:
+                    if len(f) != 3:
+                        raise ValueError
+                    tokens, ms = count(f[1]), float(f[2])
+                    if not math.isfinite(ms) or ms < 0:
+                        raise ValueError
+                except ValueError:
+                    raise out_of_step(line) from None
+                return {"tokens": tokens, "bytes": None, "ms": ms, "pending": True}
             if head == want:
                 try:
                     if len(f) != 4:
