@@ -271,6 +271,24 @@ ENGINE_READY_S = _timeout_env("STRATA_ENGINE_READY_S", 900.0)
 
 
 # ------------------------------------------------------------------------------------------------ engines
+
+EMPTY_THINK = "<think>\n\n</think>\n\n"
+ASSISTANT_HEADER = "<|im_start|>assistant\n"
+
+
+def keep_empty_think_in_history(text: str) -> str:
+    """With thinking off, the template writes an assistant turn's header and its answer, and the empty thinking block
+    only for the turn being generated. A turn that was generated with thinking off did have that block in front of its
+    answer, so it goes back in front of every assistant turn that lacks it (a block already there is left as it is)."""
+    parts = text.split(ASSISTANT_HEADER)
+    if len(parts) == 1:
+        return text
+    out = [parts[0]]
+    for part in parts[1:]:
+        out.append(ASSISTANT_HEADER + (part if part.startswith("<think>") else EMPTY_THINK + part))
+    return "".join(out)
+
+
 class Engine(Protocol):
     max_context: int
     def generate(self, ids: list[int], max_new: int, sampling: dict, cancel: threading.Event) -> Iterator[int]: ...
@@ -3935,6 +3953,14 @@ class Service:
                         "total_gib": scaled(hw.get("ram_total"), 2 ** 30, 1)} if hw.get("ram_total") else None}}
 
     def render_prompt(self, messages, tools, kwargs) -> str:
+        """The template rendered, and with thinking off the history's assistant turns keep the empty thinking block
+        (keep_empty_think_in_history): the turn that wrote them was generated after it, so the saved K/V holds it."""
+        text = self._render_prompt(messages, tools, kwargs)
+        if kwargs.get("enable_thinking") is False:
+            return keep_empty_think_in_history(text)
+        return text
+
+    def _render_prompt(self, messages, tools, kwargs) -> str:
         """The template rendered.  #458: with `effort_end`, a request with a non-default effort (low, medium or no
         thinking) is rendered as a default one up to the answer - the same prompt start, so the conversation cache
         keeps it - and its effort follows in a short system turn right before the answer (thinking off: the template's
