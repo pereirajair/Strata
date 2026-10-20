@@ -14431,6 +14431,10 @@ int main(int argc, char** argv) {
                         refuse("no idle batch slot to restore into");
                         continue;
                     }
+                    // a layer split reads a file of its own split or a whole one (split into its stages below)
+                    std::vector<const strata::core::SessionState*> slot_stages;
+                    if (!stages.empty())
+                        for (size_t k = 0; k <= stages.size(); ++k) slot_stages.push_back(bslot_ss[k][(size_t) slot].get());
                     strata::core::SavedConversation image;
                     size_t bytes = 0;
                     bool ok_read = false;
@@ -14446,9 +14450,13 @@ int main(int argc, char** argv) {
                                   (avail ? std::to_string(*avail >> 20) + " MiB available)" : "RAM telemetry unavailable)");
                             return false;
                         };
-                        if (!strata::core::conversation_session_read_limits(
-                                limits, *bslot_ss[0][(size_t) slot], g, mtp.kv_state(), (uint64_t) o.max_context,
-                                (uint64_t) std::max(o.prompt_cache, 1), err)) {
+                        if (!(slot_stages.empty()
+                                  ? strata::core::conversation_session_read_limits(
+                                        limits, *bslot_ss[0][(size_t) slot], g, mtp.kv_state(), (uint64_t) o.max_context,
+                                        (uint64_t) std::max(o.prompt_cache, 1), err)
+                                  : strata::core::conversation_session_read_limits_split(
+                                        limits, slot_stages, g, mtp.kv_state(), (uint64_t) o.max_context,
+                                        (uint64_t) std::max(o.prompt_cache, 1), err))) {
                             refuse(err, strata::core::SessionError::io);
                             continue;
                         }
@@ -14498,6 +14506,16 @@ int main(int argc, char** argv) {
                             continue;
                         }
                         image = std::move(joined);
+                    }
+                    if (!stages.empty() && image.stage_images.empty()) {
+                        // a whole session (a machine with one GPU saved it) on this layer split: cut into its stages
+                        std::string e;
+                        if (!strata::core::conversation_split_stages(image, slot_stages, g, e)) {
+                            refuse(e, strata::core::SessionError::invalid);
+                            continue;
+                        }
+                        std::fprintf(stderr, "strata serve: a whole session split into %zu stages for slot %d\n",
+                                     stages.size() + 1, slot);
                     }
                     if (split_slot || !image.stage_images.empty()) {
                         // a layer split: the file's topology must be this engine's (a conversion between topologies is not

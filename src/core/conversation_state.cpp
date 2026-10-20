@@ -793,4 +793,122 @@ ConversationRestore conversation_snapshot_restore_prefix(const SavedConversation
         return ConversationRestore::transfer_failed;
     return ConversationRestore::restored;
 }
+
+bool conversation_session_read_limits_split(SessionReadLimits& limits, const std::vector<const SessionState*>& stages,
+                                            const ModelGeometry& g, const QsaState& draft, uint64_t max_tokens,
+                                            uint64_t max_checkpoints, std::string& error) {
+    if (stages.empty()) return fail(error, "no stage to read a session for");
+    SessionReadLimits joined = limits;
+    std::array<uint64_t, 5> state{};
+    std::vector<std::array<uint64_t, 5>> kv;
+    uint64_t tokens = 0;
+    for (size_t k = 0; k < stages.size(); ++k) {
+        SessionReadLimits one = limits;
+        if (!conversation_session_read_limits(one, *stages[k], g, draft, max_tokens, max_checkpoints, error))
+            return false;
+        // a block of the whole image is the stages' blocks end to end; `ple` is one history, the largest of them
+        for (size_t b = 0; b < state.size(); ++b)
+            state[b] = b == 1 ? std::max(state[b], one.max_state_bytes[b]) : state[b] + one.max_state_bytes[b];
+        // each stage's own K/V layers, then the draft layer once, at the end
+        kv.insert(kv.end(), one.max_kv_bytes.begin(), one.max_kv_bytes.end() - 1);
+        if (k + 1 == stages.size()) kv.push_back(one.max_kv_bytes.back());
+        tokens = std::max(tokens, one.max_tokens);
+        joined.geometry = one.geometry;
+    }
+    joined.max_tokens = tokens;
+    joined.max_checkpoints = max_checkpoints;
+    joined.max_kv_layers = kv.size();
+    joined.layer_range.reset();
+    joined.max_state_bytes = state;
+    joined.max_kv_bytes = std::move(kv);
+    limits = std::move(joined);
+    return true;
+}
+
+namespace {
+
+// One stage's part of a whole checkpoint: the bytes at `at` (advanced) of each per-layer block, and `ple` when the
+// stage keeps a history.
+bool cut_checkpoint(const ConversationCheckpoint& whole, const SessionState& ss, const ModelGeometry& g,
+                    std::array<size_t, 4>& at, ConversationCheckpoint& part, std::string& error) {
+    ConversationStateSizes z;
+    if (!conversation_session_sizes(g, ss, z, error)) return false;
+    const size_t layers = owned_qsa(ss);
+    const std::array<size_t, 4> n{z.gdn, layers * z.tail, layers * z.dead, layers * z.block_pos};
+    const std::array<const std::vector<uint8_t>*, 4> from{&whole.gdn, &whole.tails, &whole.dead, &whole.block_pos};
+    const std::array<std::vector<uint8_t>*, 4> to{&part.gdn, &part.tails, &part.dead, &part.block_pos};
+    for (size_t b = 0; b < n.size(); ++b) {
+        if (from[b]->size() < at[b] || from[b]->size() - at[b] < n[b])
+            return fail(error, "topology: the whole session's running state is smaller than the stages'");
+        to[b]->assign(from[b]->begin() + (std::ptrdiff_t) at[b], from[b]->begin() + (std::ptrdiff_t) (at[b] + n[b]));
+        at[b] += n[b];
+    }
+    if (ss.ple_hist) {
+        if (whole.ple.size() != z.ple) return fail(error, "topology: the whole session has no ple history for a stage");
+        part.ple = whole.ple;
+    }
+    part.ids = whole.ids;
+    part.imgs = whole.imgs;
+    part.used = whole.used;
+    part.pinned = whole.pinned;
+    return true;
+}
+
+bool cut_all(const ConversationCheckpoint& whole, const std::vector<const SessionState*>& stages,
+             const ModelGeometry& g, std::vector<ConversationCheckpoint>& parts, std::string& error) {
+    if (!whole.stage_parts.empty()) return fail(error, "topology: a checkpoint of a split cannot be split again");
+    std::array<size_t, 4> at{};
+    parts.assign(stages.size(), ConversationCheckpoint());
+    for (size_t k = 0; k < stages.size(); ++k)
+        if (!cut_checkpoint(whole, *stages[k], g, at, parts[k], error)) return false;
+    if (at[0] != whole.gdn.size() || at[1] != whole.tails.size() || at[2] != whole.dead.size() ||
+        at[3] != whole.block_pos.size())
+        return fail(error, "topology: the whole session's running state is not the stages' total");
+    return true;
+}
+
+} // namespace
+
+bool conversation_split_stages(SavedConversation& image, const std::vector<const SessionState*>& stages,
+                               const ModelGeometry& g, std::string& error) {
+    if (stages.empty()) return fail(error, "topology: no stage to split into");
+    conversation_checkpoint_join(image.live.gdn.data());   // (the running state is read below)
+    for (const auto& c : image.checkpoints) conversation_checkpoint_join(c.gdn.data());
+    if (!image.stage_images.empty()) return fail(error, "topology: the session is already split");
+    for (size_t k = 1; k < stages.size(); ++k)
+        if (stages[k]->layer_lo != stages[k - 1]->layer_hi)
+            return fail(error, "topology: the stages' layer ranges are not contiguous");
+    if (image.layer_lo != stages.front()->layer_lo || image.layer_hi != stages.back()->layer_hi)
+        return fail(error, "topology: the session's layers are not the stages' layers");
+    size_t layers = 0;
+    for (const auto* ss : stages) layers += owned_qsa(*ss);
+    if (image.kv.size() != layers && image.kv.size() != layers + 1)
+        return fail(error, "topology: the session's K/V layers are not the stages'");
+    const bool draft = image.kv.size() == layers + 1;
+    std::vector<SavedConversation> out(stages.size());
+    std::vector<ConversationCheckpoint> live;
+    if (!cut_all(image.live, stages, g, live, error)) return false;
+    std::vector<std::vector<ConversationCheckpoint>> chain(image.checkpoints.size());
+    for (size_t c = 0; c < image.checkpoints.size(); ++c)
+        if (!cut_all(image.checkpoints[c], stages, g, chain[c], error)) return false;
+    size_t kv_at = 0;
+    for (size_t k = 0; k < stages.size(); ++k) {
+        SavedConversation& s = out[k];
+        s.geometry = image.geometry;
+        s.cvec = image.cvec;
+        s.layer_lo = stages[k]->layer_lo;
+        s.layer_hi = stages[k]->layer_hi;
+        s.live = std::move(live[k]);
+        for (auto& c : chain) s.checkpoints.push_back(std::move(c[k]));
+        const size_t n = owned_qsa(*stages[k]);
+        s.kv.assign(image.kv.begin() + (std::ptrdiff_t) kv_at, image.kv.begin() + (std::ptrdiff_t) (kv_at + n));
+        kv_at += n;
+    }
+    if (draft) out.back().kv.push_back(image.kv.back());
+    SavedConversation first = std::move(out.front());
+    for (size_t k = 1; k < out.size(); ++k) first.stage_images.push_back(std::move(out[k]));
+    image = std::move(first);
+    return true;
+}
+
 } // namespace strata::core
