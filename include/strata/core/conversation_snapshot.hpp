@@ -6,6 +6,7 @@
 #include "strata/core/session.hpp"
 
 #include <string>
+#include <vector>
 
 namespace strata::core {
 
@@ -43,6 +44,20 @@ bool conversation_kv_part_sizes(const QsaState& state, const ModelGeometry& g, i
 bool conversation_session_read_limits(SessionReadLimits& limits, const SessionState& session, const ModelGeometry& g,
                                       const QsaState& draft, uint64_t max_tokens, uint64_t max_checkpoints,
                                       std::string& error);
+// The same for a layer split, one session per GPU stage in layer order (`stages[0]` holds the first layers): a file
+// saved with that split (one image per stage) or by a machine with every layer (one whole image, split by
+// conversation_split_stages) is admitted.  The layer range is not bounded here: each stage's image is checked against
+// its own session when it is validated.
+bool conversation_session_read_limits_split(SessionReadLimits& limits, const std::vector<const SessionState*>& stages,
+                                            const ModelGeometry& g, const QsaState& draft, uint64_t max_tokens,
+                                            uint64_t max_checkpoints, std::string& error);
+// The inverse of conversation_merge_stages: a whole image (every layer, as a machine with one GPU saves it) becomes
+// the image of a layer split, `image` the first stage's and its stage_images the later ones', carved by each stage's
+// session.  The recurrent blocks and the K/V layers are per layer in layer order, so they are cut at each stage's
+// sizes; `ple` goes to every stage that keeps a history; the draft layer's K/V goes to the last stage.  Refused, and
+// `image` left alone, unless its layer range is the stages' union and every block has the stages' total size.
+bool conversation_split_stages(SavedConversation& image, const std::vector<const SessionState*>& stages,
+                               const ModelGeometry& g, std::string& error);
 
 struct ConversationStateSizes {
     size_t gdn = 0, ple = 0, tail = 0, dead = 0, block_pos = 0;
