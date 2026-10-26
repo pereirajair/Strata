@@ -10810,6 +10810,13 @@ int main(int argc, char** argv) {
                             const char* v = std::getenv("STRATA_STAGE_JOIN_PIECES");
                             return v == nullptr || std::strcmp(v, "0") != 0;
                         }();
+                        // How long the first stage waits for the next pieces before it starts reading (ms, per
+                        // gathering): the later stage sends its pieces ahead together, but over the network they come a
+                        // few ms apart, and without a wait the first piece of every prompt was read alone.
+                        static const int join_wait_ms = [] {
+                            const char* v = std::getenv("STRATA_STAGE_JOIN_WAIT_MS");
+                            return v != nullptr ? std::max(0, std::atoi(v)) : 50;
+                        }();
                         const int64_t join_cap = std::max<int64_t>(1, sp.chunk());
                         int64_t joined = 0;
                         if (!parse(req, batch[0])) {
@@ -10817,9 +10824,15 @@ int main(int argc, char** argv) {
                         } else {
                             if (o.stage_lo == 0 && join_pieces) {
                                 joined = batch[0].n;
+                                const auto join_until =
+                                    std::chrono::steady_clock::now() + std::chrono::milliseconds(join_wait_ms);
                                 while (!batch.back().save && joined < join_cap) {
+                                    const int left = (int) std::max<int64_t>(
+                                        0, std::chrono::duration_cast<std::chrono::milliseconds>(
+                                               join_until - std::chrono::steady_clock::now())
+                                               .count());
                                     pollfd pfd{cfd, POLLIN, 0};
-                                    if (::poll(&pfd, 1, 0) <= 0 || (pfd.revents & POLLIN) == 0) break;
+                                    if (::poll(&pfd, 1, left) <= 0 || (pfd.revents & POLLIN) == 0) break;
                                     std::vector<char> more;
                                     if (!sl::recv_msg(cfd, more)) {
                                         lost = true;
