@@ -14290,7 +14290,14 @@ int main(int argc, char** argv) {
                 if (!split_slot && (!stages.empty() || multi_gpu)) { refuse("session files do not support --layer-split"); continue; }
                 if (stage_mode) { refuse("session files do not support a stage per process"); continue; }
                 if (o.peer_device >= 1) { refuse("session files do not support --peer-device"); continue; }
-                if (slot < 0 && o.batch > 0) { refuse("session files do not support --batch (parallel requests)"); continue; }
+                // with --batch the main session (the one a request reads its prompt into) can be saved, whole or as a
+                // delta, while no slot decodes: a prefill machine saves the prompt it read there piece by piece. It is
+                // never restored: the conversations a batch engine continues come back into its slots
+                if (slot < 0 && o.batch > 0 && !save) { refuse("session files do not support --batch (parallel requests)"); continue; }
+                if (slot < 0 && o.batch > 0 && batch_on()) {
+                    refuse("a batch slot is decoding: the main session is saved when every slot is idle");
+                    continue;
+                }
                 if (o.prompt_cache <= 0) { refuse("session files need --prompt-cache > 0"); continue; }
                 if (!ver.wait_commit(err)) {
                     std::printf("ERR %s\n", err.c_str());
