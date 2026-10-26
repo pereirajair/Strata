@@ -2239,7 +2239,16 @@ class StrataEngine:
                 else:
                     # a turn that ended on its own token (the consumer stopped at the EOS, or the length) is handed to its
                     # owner in the same way as at BDONE: the engine's BDONE comes at once, the slot holds the turn until then
-                    # the engine says how the turn ended (BDONE's finish): stop or length hands the turn to its owner
+                    # the engine says how the turn ended (BDONE's finish): stop or length hands the turn to its owner.
+                    # A consumer that left before the turn's end (a reasoning budget's wrap-up, a stop string) BSTOPs
+                    # the slot first: otherwise it decodes on until the wait below gives up (60 s of lost tokens)
+                    if (phase == "slot" and turn_hook is not None and gen0 is not None and not cancel.is_set()
+                            and not stop_sent and not (out and out[-1] in EOS_IDS) and len(out) < int(max_new)):
+                        try:
+                            self._send(f"BSTOP {slot}")
+                            stop_sent = True
+                        except EngineDied:
+                            pass
                     ended = (self._await_bdone(slot, list(prompt) + out[gen0:])
                              if phase == "slot" and turn_hook is not None and gen0 is not None and not cancel.is_set()
                              else None)
