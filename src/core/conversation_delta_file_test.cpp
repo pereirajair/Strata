@@ -129,6 +129,7 @@ void file_round_trip_onto_a_partial_base() {
     size_t read = 0;
     check(session_delta_read(path, id, delta, read, error), "read the delta file back");
     check(read == written, "the file size is what the writer reported");
+    check(delta.base_fingerprint == fp_sender, "the base fingerprint comes back from the file");
     SavedConversation base = meta_with(old_ids);
     base.kv.resize(2);
     for (size_t layer = 0; layer < 2; ++layer) {
@@ -141,7 +142,6 @@ void file_round_trip_onto_a_partial_base() {
         base.kv[layer].v_scale = buffer_of(std::vector<uint8_t>(full.raw[layer * 5 + 3].begin(), full.raw[layer * 5 + 3].begin() + 8 * 2 * 2), 8 * 2 * 2);
         base.kv[layer].pooled = buffer_of(std::vector<uint8_t>(full.raw[layer * 5 + 4].begin(), full.raw[layer * 5 + 4].begin() + 2 * 5 * 4), 2 * 5 * 4);
     }
-    delta.base_fingerprint = fp_sender;
     check(session_delta_apply(base, delta, error), "apply the delta to its base");
     check(base.live.ids == new_ids, "the live conversation is the sender's");
     for (size_t layer = 0; layer < 2; ++layer) {
@@ -186,7 +186,6 @@ void a_base_of_another_conversation_is_refused_untouched() {
         other.kv[layer].v_scale = buffer_of(std::vector<uint8_t>(8 * 2 * 2, 0), 8 * 2 * 2);
         other.kv[layer].pooled = buffer_of(std::vector<uint8_t>(2 * 5 * 4, 0), 2 * 5 * 4);
     }
-    delta.base_fingerprint = session_base_fingerprint({1, 2, 3, 4, 5, 6, 7, 8}, {8, 8}, {2, 2});
     check(!session_delta_apply(other, delta, error), "a base of another conversation is refused");
     check(!error.empty(), "the refusal says why");
     check(other.live.ids.size() == 8 && other.live.ids[0] == 9, "the refused base keeps its live conversation");

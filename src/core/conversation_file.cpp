@@ -1259,11 +1259,12 @@ bool session_file_read(const std::string& path, const SessionFileIdentity& id, S
 namespace {
 constexpr char kDeltaMagic[8] = {'S', 'T', 'R', 'S', 'D', 'L', 'T', '\x01'};
 constexpr char kDeltaEnd[8] = {'S', 'T', 'R', 'S', 'D', 'E', 'N', '\x01'};
+constexpr uint32_t kDeltaVersion = 3;   // 3: the payload carries the base fingerprint after the base extents
 
 void delta_header_bytes(uint8_t* h, const SessionFileIdentity& id, uint64_t payload) {
     std::memset(h, 0, kHeader);
     std::memcpy(h, kDeltaMagic, 8);
-    const uint32_t version = kVersion, size = kHeader;
+    const uint32_t version = kDeltaVersion, size = kHeader;
     std::memcpy(h + 8, &version, 4);
     std::memcpy(h + 12, &size, 4);
     std::memcpy(h + 16, &id.model, 8);
@@ -1274,7 +1275,8 @@ void delta_header_bytes(uint8_t* h, const SessionFileIdentity& id, uint64_t payl
 }
 
 void put_delta_payload(Out& o, const SavedConversation& meta, const std::vector<SessionKvSource>& tails,
-                       const std::vector<int64_t>& base_cells, const std::vector<int64_t>& base_pooled) {
+                       const std::vector<int64_t>& base_cells, const std::vector<int64_t>& base_pooled,
+                       uint64_t base_fingerprint) {
     for (int64_t g : meta.geometry) o.i64(g);
     o.i64(meta.layer_lo); o.i64(meta.layer_hi); o.u64(meta.cvec ? 1 : 0);
     put_checkpoint(o, meta.live);
@@ -1284,6 +1286,7 @@ void put_delta_payload(Out& o, const SavedConversation& meta, const std::vector<
     for (int64_t v : base_cells) o.i64(v);
     o.u64(base_pooled.size());
     for (int64_t v : base_pooled) o.i64(v);
+    o.u64(base_fingerprint);
     o.u64(tails.size());
     for (const auto& k : tails) {
         put_kv_header(o, k.format, k.cells, k.heads, k.head_dim, k.page_size, k.pooled_rows, k.idx_dim);
@@ -1315,6 +1318,7 @@ bool get_delta_payload(In& in, SessionDelta& d) {
     d.base_pooled.resize((size_t) m);
     for (auto& v : d.base_pooled) if (!in.i64(v)) return false;
     if (m != n) return in.fail("delta base extents disagree in number");
+    if (!in.u64(d.base_fingerprint)) return false;
     if (!in.count(n, 96, in.limits.max_kv_layers)) return false;
     if (n != m) return in.fail("delta tails disagree with the base extents in number");
     d.tails.resize((size_t) n);
@@ -1338,7 +1342,8 @@ bool get_delta_payload(In& in, SessionDelta& d) {
 // Mirrors write_impl: the same publication, the same space preflight, the same checksums, a different kind of file.
 bool write_delta_impl(const std::string& path, const SavedConversation& meta, const std::vector<SessionKvSource>& tails,
                       const std::vector<int64_t>& base_cells, const std::vector<int64_t>& base_pooled,
-                      const SessionFileIdentity& id, size_t& bytes, std::string& error, const SessionWriteOptions& opt,
+                      uint64_t base_fingerprint, const SessionFileIdentity& id, size_t& bytes, std::string& error,
+                      const SessionWriteOptions& opt,
                       SessionStatus& st) {
     st = {};
     st.error = SessionError::invalid;
@@ -1349,7 +1354,7 @@ bool write_delta_impl(const std::string& path, const SavedConversation& meta, co
         return false;
     }
     Out sizing;
-    put_delta_payload(sizing, meta, tails, base_cells, base_pooled);
+    put_delta_payload(sizing, meta, tails, base_cells, base_pooled, base_fingerprint);
     if (sizing.overflow || sizing.n > UINT64_MAX - kHeader - kTrailer ||
         sizing.n + kHeader + kTrailer > (uint64_t) std::numeric_limits<size_t>::max()) {
         error = "session delta: the delta is too large for this build";
@@ -1390,7 +1395,7 @@ bool write_delta_impl(const std::string& path, const SavedConversation& meta, co
     Out out;
     out.f = &f;
     out.hash = &hash;
-    if (ok) put_delta_payload(out, meta, tails, base_cells, base_pooled);
+    if (ok) put_delta_payload(out, meta, tails, base_cells, base_pooled, base_fingerprint);
     ok = ok && out.ok && out.n == payload;
     if (ok) {
         const uint64_t ph = hash.digest();
@@ -1447,7 +1452,7 @@ bool read_delta_impl(const std::string& path, const SessionFileIdentity& id, Ses
     std::memcpy(&r0, h + 40, 8); std::memcpy(&r1, h + 48, 8); std::memcpy(&hh, h + 56, 8);
     if (std::memcmp(h, kDeltaMagic, 8) != 0) { error = "session delta: not a Strata session delta (magic)"; return false; }
     if (hh != session_hash64(h, 56, 0)) { error = "session delta: header checksum mismatch"; return false; }
-    if (version != kVersion) { error = "session delta: unsupported version " + std::to_string(version); return false; }
+    if (version != kDeltaVersion) { error = "session delta: unsupported version " + std::to_string(version); return false; }
     if (hsize != kHeader || r0 || r1) { error = "session delta: invalid header fields"; return false; }
     if (model != id.model) { error = "session delta: saved with another model"; return false; }
     if (config != id.config) { error = "session delta: saved with another engine configuration"; return false; }
@@ -1521,11 +1526,10 @@ bool session_delta_write(const std::string& path, const SavedConversation& meta,
                          const std::vector<int64_t>& base_pooled, uint64_t base_fingerprint,
                          const SessionFileIdentity& id, size_t& bytes, std::string& error,
                          const SessionWriteOptions& opt, SessionStatus* status) {
-    (void) base_fingerprint;   // stored by the caller in the delta's identity; the payload carries the extents
     SessionStatus st;
     bool ok = false;
     try {
-        ok = write_delta_impl(path, meta, tails, base_cells, base_pooled, id, bytes, error, opt, st);
+        ok = write_delta_impl(path, meta, tails, base_cells, base_pooled, base_fingerprint, id, bytes, error, opt, st);
     } catch (const std::bad_alloc&) {
         error = "session delta: out of memory while writing " + path;
         st.error = SessionError::memory;
