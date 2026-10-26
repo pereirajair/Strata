@@ -113,11 +113,86 @@ void stream_against_a_fake_stage() {
     server.join();
     ::close(lfd);
 }
+
+// The commit folded into the next window: against a fake stage that says it takes 'V', a commit is held back and
+// goes with the next window (one round trip per step), and before any other request as a plain 'C'; against one
+// that does not (an older server, no features in its hello), every commit is its own 'C'.
+void commit_folding(bool server_folds) {
+    const uint32_t wf = 16;
+    std::string err;
+    int port = 0;
+    const int lfd = sl::tcp_open("127.0.0.1:0", true, err, &port);
+    check(lfd >= 0, "the fake stage listens");
+    std::string ops;
+    std::vector<uint32_t> keeps;
+    std::thread server([&] {
+        const int cfd = ::accept(lfd, nullptr, nullptr);
+        std::vector<char> req;
+        while (sl::recv_msg(cfd, req)) {
+            std::vector<char> ans{0};
+            size_t at = 1;
+            const char op = req[0];
+            ops += op;
+            if (op == 'H') {
+                sl::put<uint32_t>(ans, 0);
+                sl::put<uint32_t>(ans, 10);
+                sl::put<uint32_t>(ans, wf);
+                sl::put<uint32_t>(ans, wf);
+                if (server_folds) sl::put<uint32_t>(ans, sl::PrevStage::kFoldCommit);
+            } else if (op == 'W' || op == 'V') {
+                int64_t pos0 = 0;
+                uint32_t T = 0;
+                sl::get(req, at, pos0);
+                sl::get(req, at, T);
+                if (op == 'V') {
+                    size_t kat = at + (size_t) T * 4;
+                    uint32_t n = 0;
+                    sl::get(req, kat, n);
+                    keeps.push_back(n);
+                    check(req.size() == kat, "a folded window ends with its n_keep");
+                } else {
+                    check(req.size() == at + (size_t) T * 4, "a plain window ends with its tokens");
+                }
+                std::vector<float> rows((size_t) T * wf, (float) pos0);
+                sl::put_bytes(ans, rows.data(), rows.size() * sizeof(float));
+            } else if (op == 'C') {
+                uint32_t n = 0;
+                sl::get(req, at, n);
+                keeps.push_back(n);
+            }
+            if (!sl::send_msg(cfd, ans, (op == 'W' || op == 'V') ? 1 : 0)) break;
+        }
+        ::close(cfd);
+    });
+    {
+        sl::PrevStage prev;
+        check(prev.connect("127.0.0.1:" + std::to_string(port), "", 10, err), "the later stage connects");
+        check(prev.folds_commit() == server_folds, "the hello says whether the commit folds");
+        std::vector<float> rows(4 * wf);
+        const int32_t toks[4] = {1, 2, 3, 4};
+        check(prev.window(3, toks, 50, rows.data(), err) && rows[0] == 50.0f, "the first window");
+        check(prev.commit(2, err), "its commit");
+        check(prev.window(4, toks, 52, rows.data(), err) && rows[0] == 52.0f, "the next window");
+        check(prev.commit(1, err), "its commit");
+        int how = 0;
+        prev.resume(nullptr, 0, how, err);   // any other request: the held commit goes first
+    }
+    server.join();
+    ::close(lfd);
+    if (server_folds) {
+        check(ops == "HWVCR", "the commit rides the next window, and goes alone before another request");
+    } else {
+        check(ops == "HWCWCR", "an older stage gets a 'C' after every window");
+    }
+    check(keeps == std::vector<uint32_t>({2, 1}), "the commits keep their counts and order");
+}
 }  // namespace
 
 int main() {
     envelope();
     stream_against_a_fake_stage();
+    commit_folding(true);
+    commit_folding(false);
     std::printf("stage_link_test: %d checks passed\n", checks);
     return 0;
 }
