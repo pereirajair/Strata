@@ -13568,8 +13568,10 @@ int main(int argc, char** argv) {
             }
             const uint32_t wf = (uint32_t) strata::core::Verifier::handoff_floats(g);
             const uint32_t pf = (uint32_t) strata::prefill::Prefill::handoff_floats();
-            std::fprintf(stderr, "strata serve: stage of layers %lld-%lld listening on %s (port %d)\n",
-                         (long long) o.stage_lo, (long long) o.stage_hi - 1, o.stage_listen.c_str(), bound);
+            std::fprintf(stderr, "strata serve: stage of layers %lld-%lld listening on %s (port %d), prompt chunk %lld "
+                                 "tokens\n",
+                         (long long) o.stage_lo, (long long) o.stage_hi - 1, o.stage_listen.c_str(), bound,
+                         (long long) sp.chunk());
             std::printf("READY stage\n");
             std::fflush(stdout);
             std::vector<char> req, ans, rows;
@@ -13757,7 +13759,10 @@ int main(int argc, char** argv) {
                     } else if (op == 'P') {
                         // A prompt piece.  A middle stage first gathers the pieces already waiting behind it (the later
                         // stage sends them ahead) and asks its own earlier stage for all of them at once, so every
-                        // stage reads at the same time; each piece is answered as soon as it is read.
+                        // stage reads at the same time; each piece is answered as soon as it is read.  The first stage
+                        // gathers them too, up to its prompt chunk, and reads them in one pass: the experts it streams
+                        // from RAM come in once for all of them instead of once a piece (a card on a slow PCIe link read
+                        // 1024-token pieces at a third of its whole-model prompt speed).
                         struct PPiece {
                             int64_t pos0 = 0;
                             uint32_t n = 0;
@@ -13775,9 +13780,38 @@ int main(int argc, char** argv) {
                             return true;
                         };
                         std::vector<PPiece> batch(1);
+                        // the first stage joins pieces up to its chunk; a piece that saves a checkpoint ends a batch
+                        static const bool join_pieces = [] {
+                            const char* v = std::getenv("STRATA_STAGE_JOIN_PIECES");
+                            return v == nullptr || std::strcmp(v, "0") != 0;
+                        }();
+                        const int64_t join_cap = std::max<int64_t>(1, sp.chunk());
+                        int64_t joined = 0;
                         if (!parse(req, batch[0])) {
                             fail("a malformed prompt chunk");
                         } else {
+                            if (o.stage_lo == 0 && join_pieces) {
+                                joined = batch[0].n;
+                                while (!batch.back().save && joined < join_cap) {
+                                    pollfd pfd{cfd, POLLIN, 0};
+                                    if (::poll(&pfd, 1, 0) <= 0 || (pfd.revents & POLLIN) == 0) break;
+                                    std::vector<char> more;
+                                    if (!sl::recv_msg(cfd, more)) {
+                                        lost = true;
+                                        break;
+                                    }
+                                    PPiece pc;
+                                    if (parse(more, pc) && pc.pos0 == batch.back().pos0 + (int64_t) batch.back().n &&
+                                        joined + (int64_t) pc.n <= join_cap) {
+                                        joined += pc.n;
+                                        batch.push_back(std::move(pc));
+                                    } else {
+                                        next_req.swap(more);
+                                        have_next = true;
+                                        break;
+                                    }
+                                }
+                            }
                             if (o.stage_lo > 0) {
                                 while ((int) batch.size() < std::max(stage_depth, 1)) {
                                     pollfd pfd{cfd, POLLIN, 0};
@@ -13816,6 +13850,71 @@ int main(int argc, char** argv) {
                                 }
                             }
                             bool failed = ans[0] != 0;
+                            if (o.stage_lo == 0 && batch.size() > 1 && !failed) {
+                                // One pass over the joined pieces; each piece is answered as soon as its rows are out.
+                                const int64_t pos0 = batch.front().pos0;
+                                std::vector<int64_t> all;
+                                all.reserve((size_t) joined);
+                                for (const PPiece& pc : batch) all.insert(all.end(), pc.toks.begin(), pc.toks.end());
+                                size_t k = 0;      // the piece being filled
+                                int64_t got = 0;   // its rows so far
+                                std::string pe;
+                                bool ok = room(pos0 + (int64_t) all.size());
+                                if (!ok) pe = "the K/V cannot grow to " + std::to_string(pos0 + (int64_t) all.size()) + " cells";
+                                if (ok) {
+                                    if (held_ok && pos0 != (int64_t) held.size()) held_lost("a prompt piece not at its end");
+                                    ans.assign(1, (char) 0);
+                                    ans.reserve(1 + (size_t) batch[0].n * pf * sizeof(float));
+                                    strata::prefill::Prefill& out_sp = stages.empty() ? sp : stages.back()->sp;
+                                    out_sp.remote_next = [&](const float* r, int64_t T, int64_t, std::string&) {
+                                        while (T > 0 && k < batch.size()) {
+                                            const int64_t take = std::min<int64_t>(T, (int64_t) batch[k].n - got);
+                                            if (take <= 0) break;   // more rows than the pieces hold: refused below
+                                            sl::put_bytes(ans, r, (size_t) take * pf * sizeof(float));
+                                            r += (size_t) take * pf;
+                                            T -= take;
+                                            got += take;
+                                            if (got == (int64_t) batch[k].n && k + 1 < batch.size()) {
+                                                // every piece but the last is answered here; the last one below
+                                                if (!sl::send_msg(cfd, ans, 1)) lost = true;
+                                                ++k;
+                                                got = 0;
+                                                ans.assign(1, (char) 0);
+                                                ans.reserve(1 + (size_t) batch[k].n * pf * sizeof(float));
+                                            }
+                                        }
+                                        return T == 0;
+                                    };
+                                    ok = sp.run(all.data(), (int64_t) all.size(), pos0, pe);
+                                    out_sp.remote_next = nullptr;
+                                    if (ok && (k + 1 != batch.size() || got != (int64_t) batch.back().n)) {
+                                        ok = false;
+                                        pe = "the joined prompt pieces handed off too few rows";
+                                    }
+                                }
+                                if (ok) {
+                                    if (held_ok) {
+                                        held.insert(held.end(), all.begin(), all.end());
+                                        if (batch.back().save && !save_held())
+                                            std::fprintf(stderr, "strata stage: a checkpoint at %zu tokens was not saved\n",
+                                                         held.size());
+                                    }
+                                } else {
+                                    // the pieces not answered yet fail; the last one below, as any request
+                                    if (pe.empty()) pe = "the joined prompt pieces failed";
+                                    held_lost("a prompt piece failed");
+                                    for (; k + 1 < batch.size(); ++k) {
+                                        ans.assign(1, (char) 0);
+                                        fail(pe);
+                                        if (!sl::send_msg(cfd, ans, 0)) lost = true;
+                                    }
+                                    ans.assign(1, (char) 0);
+                                    fail(pe);
+                                }
+                                std::fprintf(stderr, "strata stage: %zu prompt pieces (%lld tokens) read in one pass\n",
+                                             batch.size(), (long long) all.size());
+                                batch.clear();   // answered: the per-piece loop below has nothing left
+                            }
                             for (size_t k = 0; k < batch.size(); ++k) {
                                 const PPiece& pc = batch[k];
                                 if (k > 0) ans.assign(1, (char) 0);
