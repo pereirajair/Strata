@@ -1391,6 +1391,10 @@ class StrataEngine:
                     return None
             if line.startswith("BDONE "):
                 f = line.split()
+                # the slot leg's decode time and tokens are this request's: a turn stopped before its end (a reasoning
+                # budget's wrap-up, a stop string) kept the admission's single token otherwise, and the request's
+                # totals lost the whole leg
+                self._apply_bdone(f)
                 return (f[3] if len(f) > 3 else "", tail)
         return None
 
