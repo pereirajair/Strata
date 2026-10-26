@@ -15217,6 +15217,7 @@ int main(int argc, char** argv) {
             ConvCheckpoint::PromptPlan resume_plan;
             int64_t resume_plan_at = -1, resume_plan_end = -1;   // where it goes on, and the segment end it needs
             const ConvCheckpoint* slot_ck = nullptr;   // the slot's checkpoint the prompt continues from (else its end)
+            int64_t slot_turn_len = -1;   // the turn boundary of the slot's conversation when the prompt continues its end
             if (o.prompt_cache > 0 && req_imgs.empty())
                 for (int b = 0; b < (int) bs.size(); ++b) {
                     const BSlot& sl = bs[(size_t) b];
@@ -15497,7 +15498,17 @@ int main(int argc, char** argv) {
                             }
                         if (move_cks) moved_in = ck_len;
                     } else {
-                        live = bs[(size_t) slot_source].ids;
+                        // the prompt continues the slot's whole conversation (another leg of the same turn): its
+                        // checkpoints, the turn boundary among them, stay with it, so the turn's save still has that one
+                        const BSlot& src = bs[(size_t) slot_source];
+                        live = src.ids;
+                        if (checks.empty()) {
+                            for (const ConvCheckpoint& c : src.checks) {
+                                checks.push_back(c);
+                                checks.back().used = ++check_clock;
+                            }
+                            slot_turn_len = src.turn_len;
+                        }
                     }
                     live_imgs.clear();
                     resume = slot_tokens;
@@ -16712,7 +16723,8 @@ int main(int argc, char** argv) {
             // chat renders the same history - but not always the same header or the thinking of this reply - so that
             // checkpoint is the one it reuses.
             int64_t turn_at = -1;
-            turn_ckpt_len = -1;   // this request's turn boundary, set below when its checkpoint is taken
+            // this request's turn boundary, set below when its checkpoint is taken; else the one carried from the slot
+            turn_ckpt_len = slot_turn_len;
             if (o.prompt_cache > 0 && o.turn_token >= 0)
                 for (int64_t i = n - 1; i > resume; --i)
                     if (ids[(size_t) i] == o.turn_token) { turn_at = i; break; }
