@@ -13670,6 +13670,19 @@ int main(int argc, char** argv) {
                                                        }));
                 return true;
             };
+            // A window's commit ('C', or folded into the next window as 'V'): the first n tokens kept.
+            auto commit_window = [&](uint32_t n, std::string& e) -> bool {
+                const bool pending = win_pos0 >= 0;
+                win_pos0 = -1;
+                if (!ver.commit((int) n, e) || !ver.wait_commit(e)) {
+                    if (e.empty()) e = "a commit failed";
+                    held_lost("a commit failed");
+                    return false;
+                }
+                if (pending && held_ok && n <= win_toks.size()) held.insert(held.end(), win_toks.begin(), win_toks.begin() + n);
+                else if (held_ok) held_lost("a commit without its window");
+                return true;
+            };
             for (;;) {
                 const int cfd = ::accept(lfd, nullptr, nullptr);
                 if (cfd < 0) {
@@ -13687,7 +13700,7 @@ int main(int argc, char** argv) {
                     size_t at = 1;
                     const char op = req.empty() ? 0 : req[0];
                     ans.assign(1, (char) 0);
-                    if (win_pos0 >= 0 && op != 'C') {   // a window that was never committed left the session mid-way
+                    if (win_pos0 >= 0 && op != 'C' && op != 'V') {   // a window never committed left the session mid-way
                         win_pos0 = -1;
                         held_lost("a verify window was not committed");
                     }
@@ -13704,6 +13717,7 @@ int main(int argc, char** argv) {
                         sl::put<uint32_t>(ans, (uint32_t) o.stage_hi);
                         sl::put<uint32_t>(ans, wf);
                         sl::put<uint32_t>(ans, pf);
+                        sl::put<uint32_t>(ans, sl::PrevStage::kFoldCommit);   // this server takes 'V'
                     } else if (op == 'Z') {
                         strata::core::session_zero(ss, g, nullptr, main_cs);
                         cudaStreamSynchronize(main_stream);
@@ -13877,12 +13891,20 @@ int main(int argc, char** argv) {
                                 batch_tokens.clear();
                             }
                         }
-                    } else if (op == 'W') {
+                    } else if (op == 'W' || op == 'V') {
                         int64_t pos0 = 0;
                         uint32_t T = 0;
-                        if (!sl::get(req, at, pos0) || !sl::get(req, at, T) || req.size() != at + (size_t) T * 4 || T == 0 ||
-                            T > (uint32_t) strata::kernels::kVerifyMaxT) {
+                        // 'V': the last window's commit comes first, its n_keep after the tokens
+                        const size_t tail = op == 'V' ? 4 : 0;
+                        if (!sl::get(req, at, pos0) || !sl::get(req, at, T) || req.size() != at + (size_t) T * 4 + tail ||
+                            T == 0 || T > (uint32_t) strata::kernels::kVerifyMaxT) {
                             fail("a malformed verify window");
+                        } else if (op == 'V' && [&] {
+                                       size_t kat = at + (size_t) T * 4;
+                                       uint32_t n_keep = 0;
+                                       return !sl::get(req, kat, n_keep) || !commit_window(n_keep, e);
+                                   }()) {
+                            fail(e);
                         } else if (!room(pos0 + T)) {
                             fail("the K/V cannot grow to " + std::to_string(pos0 + T) + " cells");
                         } else {
@@ -13906,15 +13928,12 @@ int main(int argc, char** argv) {
                         }
                     } else if (op == 'C') {
                         uint32_t n = 0;
-                        const bool pending = win_pos0 >= 0;
-                        win_pos0 = -1;
-                        if (!sl::get(req, at, n) || !ver.commit((int) n, e) || !ver.wait_commit(e)) {
-                            fail(e.empty() ? "a malformed commit" : e);
+                        if (!sl::get(req, at, n)) {
+                            win_pos0 = -1;
+                            fail("a malformed commit");
                             held_lost("a commit failed");
-                        } else if (pending && held_ok && n <= win_toks.size()) {
-                            held.insert(held.end(), win_toks.begin(), win_toks.begin() + n);
-                        } else if (held_ok) {
-                            held_lost("a commit without its window");
+                        } else if (!commit_window(n, e)) {
+                            fail(e);
                         }
                     } else if (op == 'Q') {
                         quit = true;
@@ -13922,7 +13941,7 @@ int main(int argc, char** argv) {
                         fail(std::string("unknown request ") + op);
                     }
                     // the rows of a piece or a window go as a tensor (the POM carries them in the deployment's precision)
-                    const bool rows = (op == 'P' || op == 'W') && ans.size() > 1 && ans[0] == 0;
+                    const bool rows = (op == 'P' || op == 'W' || op == 'V') && ans.size() > 1 && ans[0] == 0;
                     if (!sl::send_msg(cfd, ans, rows ? 1 : 0) || quit || lost) break;
                 }
                 ::close(cfd);

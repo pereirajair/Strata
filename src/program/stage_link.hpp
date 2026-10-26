@@ -10,7 +10,8 @@
 // Frames are little-endian: u32 length, then the payload.  A request's payload starts with an op byte; an answer's
 // with a status byte (0 = ok, then the data; 1 = error, then the message).
 //
-//   'H' token                        -> u32 lo, u32 hi, u32 window_floats, u32 prompt_floats
+//   'H' token                        -> u32 lo, u32 hi, u32 window_floats, u32 prompt_floats, u32 features
+//                                       (features bit 0: the server takes 'V'; an older server sends no features)
 //   'Z'                              -> (the stage's session zeroed: a new request starts at position 0)
 //   'R' u32 n, i32 ids[n]            -> u8 how (1 = its live session, 2 = a checkpoint)   (continue after ids)
 //   'S' u32 n, i32 ids[n]            -> (a checkpoint of the session as it is, which holds exactly ids)
@@ -18,6 +19,10 @@
 //                                       stage; save = 1: a checkpoint at its end, as the later stage takes there)
 //   'W' i64 pos0, u32 T, i32 tok[T]  -> f32 rows[T * window_floats]   (a verify window read through the stage)
 //   'C' u32 n_keep                   -> (the window's first n_keep tokens kept)
+//   'V' i64 pos0, u32 T, i32 tok[T], u32 n_keep  -> as 'W', after the last window's 'C' n_keep: the commit folded
+//                                       into the next window, one round trip per step instead of two.  The later
+//                                       stage holds its commit back (PrevStage::commit) and sends it with the next
+//                                       window, or as a plain 'C' before any other request.
 //   'Q'                              -> (the stage server ends)
 //
 // The stage server answers in order, so the later stage may send several 'P' before it reads the first answer: the
@@ -34,6 +39,7 @@
 #include <algorithm>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <mutex>
@@ -215,18 +221,26 @@ public:
         }
         window_floats_ = wf;
         prompt_floats_ = pf;
+        uint32_t features = 0;
+        fold_commit_ = get(ans, at, features) && (features & kFoldCommit) != 0 && fold_allowed();
+        pending_keep_ = -1;
         return true;
     }
+    /// The commit travels with the next window ('V'): the earlier stage said it takes it.
+    bool folds_commit() const { return fold_commit_; }
+    static constexpr uint32_t kFoldCommit = 1;
     uint32_t window_floats() const { return window_floats_; }
     uint32_t prompt_floats() const { return prompt_floats_; }
 
     bool reset(std::string& err) {
+        if (!flush_commit(err)) return false;
         std::vector<char> ans;
         return call(std::vector<char>{'Z'}, ans, err);
     }
     /// The earlier stage continues after `ids` (its live session or a checkpoint of them); `how` is 1 or 2.  False
     /// with `err` when it cannot: the caller reads the prompt from position 0.
     bool resume(const int64_t* ids, int64_t n, int& how, std::string& err) {
+        if (!flush_commit(err)) return false;
         std::vector<char> ans;
         if (!call(ids_request('R', ids, n), ans, err)) return false;
         how = ans.size() > 1 ? (int) (uint8_t) ans[1] : 0;
@@ -234,21 +248,35 @@ public:
     }
     /// The earlier stage keeps a checkpoint of its session, which holds exactly `ids`.
     bool save(const int64_t* ids, int64_t n, std::string& err) {
+        if (!flush_commit(err)) return false;
         std::vector<char> ans;
         return call(ids_request('S', ids, n), ans, err);
     }
     bool window(int T, const int32_t* tokens, int64_t pos0, float* rows, std::string& err) {
-        std::vector<char> req{'W'};
+        const bool fold = pending_keep_ >= 0;
+        std::vector<char> req{fold ? 'V' : 'W'};
         put<int64_t>(req, pos0);
         put<uint32_t>(req, (uint32_t) T);
         put_bytes(req, tokens, (size_t) T * sizeof(int32_t));
+        if (fold) put<uint32_t>(req, (uint32_t) pending_keep_);
+        pending_keep_ = -1;
         return rows_call(req, rows, (size_t) T * window_floats_, err);
     }
+    /// The window's first `n_keep` tokens kept.  When the earlier stage folds commits, it is held back and goes with
+    /// the next window (or before any other request): an error in it surfaces there.
     bool commit(int n_keep, std::string& err) {
-        std::vector<char> req{'C'};
-        put<uint32_t>(req, (uint32_t) n_keep);
-        std::vector<char> ans;
-        return call(req, ans, err);
+        if (fold_commit_ && fd_ >= 0) {
+            pending_keep_ = n_keep;
+            return true;
+        }
+        return send_commit(n_keep, err);
+    }
+    /// A commit held back goes now, as a plain 'C'.
+    bool flush_commit(std::string& err) {
+        if (pending_keep_ < 0) return true;
+        const int n = pending_keep_;
+        pending_keep_ = -1;
+        return send_commit(n, err);
     }
 
     /// A piece of a prompt read through the earlier stage: one 'P' request.
@@ -262,6 +290,7 @@ public:
     bool stream_begin(const int64_t* tokens, std::vector<Piece> pieces, int depth, std::string& err) {
         stream_end();
         if (fd_ < 0) { err = "the earlier stage is not connected"; return false; }
+        if (!flush_commit(err)) return false;
         st_tokens_ = tokens;
         st_pieces_ = std::move(pieces);
         st_depth_ = std::max(1, depth);
@@ -322,6 +351,20 @@ public:
 private:
     int fd_ = -1;
     uint32_t window_floats_ = 0, prompt_floats_ = 0;
+    bool fold_commit_ = false;
+    int pending_keep_ = -1;   ///< a commit held back for the next window ('V'), or -1
+
+    /// STRATA_STAGE_FOLD_COMMIT=0 keeps a round trip per commit (the 'C' before every next window).
+    static bool fold_allowed() {
+        const char* v = std::getenv("STRATA_STAGE_FOLD_COMMIT");
+        return v == nullptr || std::strcmp(v, "0") != 0;
+    }
+    bool send_commit(int n_keep, std::string& err) {
+        std::vector<char> req{'C'};
+        put<uint32_t>(req, (uint32_t) n_keep);
+        std::vector<char> ans;
+        return call(req, ans, err);
+    }
     std::vector<char> ans_;
     // the stream (stream_begin): the pieces, how many were sent and taken, the answers not taken yet
     const int64_t* st_tokens_ = nullptr;
