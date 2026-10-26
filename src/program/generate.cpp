@@ -14580,6 +14580,11 @@ int main(int argc, char** argv) {
             }
             auto windows_ok = [&](int64_t a, int64_t b) -> bool {
                 if (no_short || b - a > req_short_read) return false;
+                // a short part after a batched one (the turn boundary's few tokens) is read batched too: the windows
+                // need the lent slots back first, and that refill (GiBs of experts over PCIe, ~1 s) costs far more
+                // than a few batched tokens with the loan still in place; the prompt's end refills once
+                for (const PfPart& p : pf_parts)
+                    if (!p.lent.empty()) return false;
                 if (sp.embd_rows != nullptr)
                     for (int64_t i = a; i < b; ++i)
                         if (sp.embd_rows[i] != nullptr) return false;
