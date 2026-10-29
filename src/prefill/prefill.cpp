@@ -1553,8 +1553,11 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     }
     {   // a native pack's experts: this path's expert buffers and products (and so their Hadamard rotations) are
         // N wide in and 640 wide in the middle; the sign vectors are looked up at the layout's own widths
+        // a layer slice holds only this stage's layers: the others are 0 x 0 in the layout and never run here
         const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
-        for (size_t l = 0; lay.native && l < lay.fmt.size(); ++l)
+        const size_t lb = (size_t) std::max<int64_t>(stage_lb_, 0);
+        const size_t le = stage_le_ < 0 ? (size_t) g.n_layers : (size_t) stage_le_;
+        for (size_t l = lb; lay.native && l < le && l < lay.fmt.size(); ++l)
             if (lay.fmt[l].n_embd != N || lay.fmt[l].n_ff != 640) {
                 err = "prefill: layer " + std::to_string(l) + "'s experts are " + std::to_string(lay.fmt[l].n_embd) +
                       " x " + std::to_string(lay.fmt[l].n_ff) + ", not the artifact's 2560 x 640";
