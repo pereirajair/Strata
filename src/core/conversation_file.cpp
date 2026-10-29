@@ -1,4 +1,5 @@
 #include "strata/core/conversation_file.hpp"
+#include "strata/core/conversation_delta.hpp"
 
 #include <algorithm>
 #include <bit>
@@ -45,7 +46,7 @@ namespace strata::core {
 namespace {
 constexpr char kMagic[8] = {'S', 'T', 'R', 'S', 'E', 'S', 'S', '\x01'};
 constexpr char kEnd[8] = {'S', 'T', 'R', 'S', 'E', 'N', 'D', '\x01'};
-constexpr uint32_t kVersion = 1;
+constexpr uint32_t kVersion = 2;   // 2: the layer-split stages' images follow the state (stage_images)
 constexpr size_t kHeader = 64, kTrailer = 16;
 
 // Progress for a transfer: one report after every block that was handed to (or read from) the OS, whatever its size
@@ -678,15 +679,21 @@ void put_kv_header(Out& o, int format, int64_t cells, int64_t heads, int64_t hea
     for (int64_t v : {int64_t(format), cells, heads, head_dim, page_size, pooled_rows, idx_dim}) o.i64(v);
 }
 
-void put_checkpoint(Out& o, const ConversationCheckpoint& c) {
+// The running state of a layer split's later GPUs (stage_parts): one part per later stage, each a plain running state.
+void put_checkpoint(Out& o, const ConversationCheckpoint& c, bool with_parts = true) {
     o.vec(c.ids);
     o.u64(c.imgs.size());
     for (const auto& k : c.imgs) { o.i64(k.start); o.u64(k.hash); }
     o.vec(c.gdn); o.vec(c.ple); o.vec(c.tails); o.vec(c.dead); o.vec(c.block_pos);
     o.u64(c.used);
+    if (!with_parts) return;
+    o.u64(c.stage_parts.size());
+    for (const auto& p : c.stage_parts) put_checkpoint(o, p, false);
 }
 
-void put_payload(Out& o, const SavedConversation& s, const std::vector<SessionKvSource>* sources = nullptr) {
+// `stages`: the image's own layer-split stages follow it (a stage's own stages are not written: there is one level).
+void put_payload(Out& o, const SavedConversation& s, const std::vector<SessionKvSource>* sources = nullptr,
+                 bool stages = true) {
     for (int64_t g : s.geometry) o.i64(g);
     o.i64(s.layer_lo); o.i64(s.layer_hi); o.u64(s.cvec ? 1 : 0);
     put_checkpoint(o, s.live);
@@ -698,12 +705,16 @@ void put_payload(Out& o, const SavedConversation& s, const std::vector<SessionKv
             put_kv_header(o, k.format, k.cells, k.heads, k.head_dim, k.page_size, k.pooled_rows, k.idx_dim);
             for (size_t part = 0; part < 5; ++part) o.source(k, part);
         }
-        return;
+    } else {
+        o.u64(s.kv.size());
+        for (const auto& k : s.kv) {
+            put_kv_header(o, k.format, k.cells, k.heads, k.head_dim, k.page_size, k.pooled_rows, k.idx_dim);
+            o.buffer(k.k); o.buffer(k.v); o.buffer(k.k_scale); o.buffer(k.v_scale); o.buffer(k.pooled);
+        }
     }
-    o.u64(s.kv.size());
-    for (const auto& k : s.kv) {
-        put_kv_header(o, k.format, k.cells, k.heads, k.head_dim, k.page_size, k.pooled_rows, k.idx_dim);
-        o.buffer(k.k); o.buffer(k.v); o.buffer(k.k_scale); o.buffer(k.v_scale); o.buffer(k.pooled);
+    if (stages) {
+        o.u64(s.stage_images.size());
+        for (const auto& st : s.stage_images) put_payload(o, st, nullptr, false);
     }
 }
 
@@ -751,18 +762,25 @@ struct In {
     }
 };
 
-bool get_checkpoint(In& in, ConversationCheckpoint& c) {
+bool get_checkpoint(In& in, ConversationCheckpoint& c, bool with_parts = true) {
     if (!in.vec(c.ids, in.limits.max_tokens)) return false;
     uint64_t n = 0;
     if (!in.count(n, 16, in.limits.max_tokens)) return false;
     c.imgs.resize((size_t) n);
     for (auto& k : c.imgs) if (!in.i64(k.start) || !in.u64(k.hash)) return false;
     const auto& m = in.limits.max_state_bytes;   // byte arrays: element and byte counts are the same
-    return in.vec(c.gdn, m[0]) && in.vec(c.ple, m[1]) && in.vec(c.tails, m[2]) && in.vec(c.dead, m[3]) &&
-           in.vec(c.block_pos, m[4]) && in.u64(c.used);
+    if (!(in.vec(c.gdn, m[0]) && in.vec(c.ple, m[1]) && in.vec(c.tails, m[2]) && in.vec(c.dead, m[3]) &&
+          in.vec(c.block_pos, m[4]) && in.u64(c.used)))
+        return false;
+    if (!with_parts) return true;
+    uint64_t parts = 0;
+    if (!in.count(parts, 72, in.limits.max_stages)) return false;
+    c.stage_parts.resize((size_t) parts);
+    for (auto& p : c.stage_parts) if (!get_checkpoint(in, p, false)) return false;
+    return true;
 }
 
-bool get_payload(In& in, SavedConversation& s) {
+bool get_payload(In& in, SavedConversation& s, bool stages = true) {
     for (auto& g : s.geometry) if (!in.i64(g)) return false;
     // checked before any state array is read: a file of another geometry allocates nothing
     if (in.limits.geometry && *in.limits.geometry != s.geometry)
@@ -792,6 +810,11 @@ bool get_payload(In& in, SavedConversation& s) {
         if (!in.buffer(k.k, 0) || !in.buffer(k.v, 1) || !in.buffer(k.k_scale, 2) || !in.buffer(k.v_scale, 3) ||
             !in.buffer(k.pooled, 4)) return false;
     }
+    if (!stages) return true;
+    // the stages' own images: a count the caller accepts, then each image (one level: its own stages are not read)
+    if (!in.count(n, 16, in.limits.max_stages)) return false;
+    s.stage_images.resize((size_t) n);
+    for (auto& st : s.stage_images) if (!get_payload(in, st, false)) return false;
     return true;
 }
 
@@ -1029,7 +1052,15 @@ bool write_impl(const std::string& path, const SavedConversation& image, const s
                 SessionStatus& st) {
     st = {};
     st.error = SessionError::invalid;   // refusals before any disk access
-    if (has_stage_parts(image)) { error = "session file: layer-split state cannot be saved"; return false; }
+    // a layer split's running state carries one part per later stage, and those stages' images come with it
+    auto parts_complete = [&](const ConversationCheckpoint& c) {
+        return c.stage_parts.empty() || c.stage_parts.size() == image.stage_images.size();
+    };
+    bool complete = parts_complete(image.live);
+    for (const auto& c : image.checkpoints) complete = complete && parts_complete(c);
+    if (!complete) { error = "session file: layer-split state is incomplete (a part for each later stage)"; return false; }
+    for (const auto& st : image.stage_images)
+        if (has_stage_parts(st) || !st.stage_images.empty()) { error = "session file: a stage's own stages are not saved"; return false; }
     if (sources && !image.kv.empty()) { error = "session file: K/V given both in the image and as sources"; return false; }
     Out sizing;
     put_payload(sizing, image, sources);
@@ -1251,6 +1282,346 @@ bool session_file_read(const std::string& path, const SessionFileIdentity& id, S
     }
     if (status) *status = st;
     return ok;
+}
+
+
+// ---- turn deltas (STRSDLT): see conversation_file.hpp
+namespace {
+constexpr char kDeltaMagic[8] = {'S', 'T', 'R', 'S', 'D', 'L', 'T', '\x01'};
+constexpr char kDeltaEnd[8] = {'S', 'T', 'R', 'S', 'D', 'E', 'N', '\x01'};
+constexpr uint32_t kDeltaVersion = 3;   // 3: the payload carries the base fingerprint after the base extents
+
+void delta_header_bytes(uint8_t* h, const SessionFileIdentity& id, uint64_t payload) {
+    std::memset(h, 0, kHeader);
+    std::memcpy(h, kDeltaMagic, 8);
+    const uint32_t version = kDeltaVersion, size = kHeader;
+    std::memcpy(h + 8, &version, 4);
+    std::memcpy(h + 12, &size, 4);
+    std::memcpy(h + 16, &id.model, 8);
+    std::memcpy(h + 24, &id.config, 8);
+    std::memcpy(h + 32, &payload, 8);
+    const uint64_t hh = session_hash64(h, 56, 0);
+    std::memcpy(h + 56, &hh, 8);
+}
+
+void put_delta_payload(Out& o, const SavedConversation& meta, const std::vector<SessionKvSource>& tails,
+                       const std::vector<int64_t>& base_cells, const std::vector<int64_t>& base_pooled,
+                       uint64_t base_fingerprint) {
+    for (int64_t g : meta.geometry) o.i64(g);
+    o.i64(meta.layer_lo); o.i64(meta.layer_hi); o.u64(meta.cvec ? 1 : 0);
+    put_checkpoint(o, meta.live);
+    o.u64(meta.checkpoints.size());
+    for (const auto& c : meta.checkpoints) put_checkpoint(o, c);
+    o.u64(base_cells.size());
+    for (int64_t v : base_cells) o.i64(v);
+    o.u64(base_pooled.size());
+    for (int64_t v : base_pooled) o.i64(v);
+    o.u64(base_fingerprint);
+    o.u64(tails.size());
+    for (const auto& k : tails) {
+        put_kv_header(o, k.format, k.cells, k.heads, k.head_dim, k.page_size, k.pooled_rows, k.idx_dim);
+        for (size_t part = 0; part < 5; ++part) o.source(k, part);
+    }
+}
+
+bool get_delta_payload(In& in, SessionDelta& d) {
+    for (auto& g : d.meta.geometry) if (!in.i64(g)) return false;
+    if (in.limits.geometry && *in.limits.geometry != d.meta.geometry)
+        return in.fail("delta saved with another model geometry than this runtime's");
+    uint64_t cvec = 0;
+    if (!in.i64(d.meta.layer_lo) || !in.i64(d.meta.layer_hi) || !in.u64(cvec)) return false;
+    if (in.limits.layer_range &&
+        (in.limits.layer_range->first != d.meta.layer_lo || in.limits.layer_range->second != d.meta.layer_hi))
+        return in.fail("delta saved with another layer range than this runtime's");
+    if (cvec > 1) return in.fail("invalid cvec flag");
+    d.meta.cvec = cvec == 1;
+    if (!get_checkpoint(in, d.meta.live)) return false;
+    uint64_t n = 0;
+    if (!in.count(n, 72, in.limits.max_checkpoints)) return false;
+    d.meta.checkpoints.resize((size_t) n);
+    for (auto& c : d.meta.checkpoints) if (!get_checkpoint(in, c)) return false;
+    if (!in.count(n, 8, in.limits.max_kv_layers)) return false;
+    d.base_cells.resize((size_t) n);
+    for (auto& v : d.base_cells) if (!in.i64(v)) return false;
+    uint64_t m = 0;
+    if (!in.count(m, 8, in.limits.max_kv_layers)) return false;
+    d.base_pooled.resize((size_t) m);
+    for (auto& v : d.base_pooled) if (!in.i64(v)) return false;
+    if (m != n) return in.fail("delta base extents disagree in number");
+    if (!in.u64(d.base_fingerprint)) return false;
+    if (!in.count(n, 96, in.limits.max_kv_layers)) return false;
+    if (n != m) return in.fail("delta tails disagree with the base extents in number");
+    d.tails.resize((size_t) n);
+    for (size_t i = 0; i < d.tails.size(); ++i) {
+        KvDelta& t = d.tails[i];
+        t.base_cells = d.base_cells[i];
+        t.base_pooled = d.base_pooled[i];
+        ConversationKv& k = t.tail;
+        in.kv_layer = i;
+        int64_t format = 0;
+        if (!in.i64(format) || !in.i64(k.cells) || !in.i64(k.heads) || !in.i64(k.head_dim) ||
+            !in.i64(k.page_size) || !in.i64(k.pooled_rows) || !in.i64(k.idx_dim)) return false;
+        if (format < INT32_MIN || format > INT32_MAX) return in.fail("invalid K/V format");
+        k.format = (int) format;
+        if (!in.buffer(k.k, 0) || !in.buffer(k.v, 1) || !in.buffer(k.k_scale, 2) || !in.buffer(k.v_scale, 3) ||
+            !in.buffer(k.pooled, 4)) return false;
+    }
+    return true;
+}
+
+// Mirrors write_impl: the same publication, the same space preflight, the same checksums, a different kind of file.
+bool write_delta_impl(const std::string& path, const SavedConversation& meta, const std::vector<SessionKvSource>& tails,
+                      const std::vector<int64_t>& base_cells, const std::vector<int64_t>& base_pooled,
+                      uint64_t base_fingerprint, const SessionFileIdentity& id, size_t& bytes, std::string& error,
+                      const SessionWriteOptions& opt,
+                      SessionStatus& st) {
+    st = {};
+    st.error = SessionError::invalid;
+    if (has_stage_parts(meta) || !meta.stage_images.empty()) {
+        error = "session delta: layer-split state cannot be saved as a delta";
+        return false;
+    }
+    if (!meta.kv.empty()) { error = "session delta: the metadata must carry no K/V"; return false; }
+    if (tails.size() != base_cells.size() || tails.size() != base_pooled.size()) {
+        error = "session delta: one base extent per K/V layer is required";
+        return false;
+    }
+    Out sizing;
+    put_delta_payload(sizing, meta, tails, base_cells, base_pooled, base_fingerprint);
+    if (sizing.overflow || sizing.n > UINT64_MAX - kHeader - kTrailer ||
+        sizing.n + kHeader + kTrailer > (uint64_t) std::numeric_limits<size_t>::max()) {
+        error = "session delta: the delta is too large for this build";
+        return false;
+    }
+    const uint64_t payload = sizing.n, total = kHeader + payload + kTrailer;
+    st.error = SessionError::io;
+    if (opt.min_free_bytes) {
+        uint64_t avail = 0;
+        if (!free_space(path, avail)) { error = "session delta: cannot read the free disk space for " + path; return false; }
+        if (avail < total || avail - total < opt.min_free_bytes) {
+            st.error = SessionError::storage;
+            error = "session delta: not enough disk space for " + path;
+            return false;
+        }
+    }
+    Publisher pub;
+    if (!pub.open(path, error)) { st.error = pub.kind(); return false; }
+    RawFile raw;
+    if (!pub.create_temp(raw, error)) {
+        st.error = raw.kind();
+        error = "session delta: cannot create a temporary file beside " + path + ": " + error;
+        return false;
+    }
+    FileSink f(raw);
+    if (!f.ok()) { st.error = SessionError::memory; error = "session delta: " + f.error(); return false; }
+    if (opt.progress) f.progress.emplace(opt.progress);
+    f.phase = opt.phase;
+    f.expected = total;
+    if (f.progress) (*f.progress)(0, total);
+    const std::function<int(const char*)>* fault = opt.fault ? &opt.fault : nullptr;
+    f.write_fault = injected(fault, "write");
+    f.flush_fault = injected(fault, "file_flush");
+    uint8_t h[kHeader];
+    delta_header_bytes(h, id, payload);
+    bool ok = f.write(h, kHeader);
+    SessionHasher hash(0);
+    Out out;
+    out.f = &f;
+    out.hash = &hash;
+    if (ok) put_delta_payload(out, meta, tails, base_cells, base_pooled, base_fingerprint);
+    ok = ok && out.ok && out.n == payload;
+    if (ok) {
+        const uint64_t ph = hash.digest();
+        ok = f.write(&ph, 8) && f.write(kDeltaEnd, 8);
+    }
+    ok = f.finish(opt.durable) && ok;
+    std::string why;
+    if (!ok) {
+        why = out.read_failed ? "K/V source read" + (out.read_error.empty() ? std::string() : ": " + out.read_error)
+                              : f.error();
+        st.error = out.read_failed ? SessionError::io : f.kind();
+    } else {
+        if (opt.phase) opt.phase("publish", total);
+        if (pub.publish(why, opt.durable, st, fault)) {
+            st.error = SessionError::none;
+            bytes = (size_t) total;
+            return true;
+        }
+    }
+    error = "session delta: writing " + path + " failed" + (why.empty() ? std::string() : ": " + why);
+    if (st.published) error += " (the new file has already replaced the old one)";
+    return false;
+}
+
+// Mirrors read_impl for the delta kind.
+bool read_delta_impl(const std::string& path, const SessionFileIdentity& id, SessionDelta& delta, size_t& bytes,
+                     std::string& error, const SessionReadLimits& limits, SessionStatus& st) {
+    error.clear();
+    st = {};
+    st.error = SessionError::invalid;
+    RawFile raw;
+    uint64_t size = 0;
+    if (!raw.open_session(path, size)) {
+        st.error = raw.refused() ? SessionError::invalid : raw.kind();
+        error = "session delta: " + path + ": " + raw.error();
+        return false;
+    }
+    if (size < kHeader + kTrailer) { error = "session delta: size " + std::to_string(size) + " is below the minimum"; return false; }
+    const uint64_t max_size = session_read_max_file_bytes(limits);
+    if (size > max_size || size > (uint64_t) std::numeric_limits<size_t>::max()) {
+        error = "session delta: size " + std::to_string(size) + " exceeds this engine's limit";
+        return false;
+    }
+    FileSource f(raw);
+    if (!f.ok()) { st.error = SessionError::memory; error = "session delta: " + f.error(); return false; }
+    if (limits.progress) f.progress.emplace(limits.progress);
+    f.expected = size;
+    uint8_t h[kHeader];
+    if (!f.read(h, kHeader)) { st.error = f.kind(); error = "session delta: header read error: " + f.error(); return false; }
+    uint32_t version = 0, hsize = 0;
+    uint64_t model = 0, config = 0, payload = 0, r0 = 0, r1 = 0, hh = 0;
+    std::memcpy(&version, h + 8, 4); std::memcpy(&hsize, h + 12, 4);
+    std::memcpy(&model, h + 16, 8); std::memcpy(&config, h + 24, 8); std::memcpy(&payload, h + 32, 8);
+    std::memcpy(&r0, h + 40, 8); std::memcpy(&r1, h + 48, 8); std::memcpy(&hh, h + 56, 8);
+    if (std::memcmp(h, kDeltaMagic, 8) != 0) { error = "session delta: not a Strata session delta (magic)"; return false; }
+    if (hh != session_hash64(h, 56, 0)) { error = "session delta: header checksum mismatch"; return false; }
+    if (version != kDeltaVersion) { error = "session delta: unsupported version " + std::to_string(version); return false; }
+    if (hsize != kHeader || r0 || r1) { error = "session delta: invalid header fields"; return false; }
+    if (model != id.model) { error = "session delta: saved with another model"; return false; }
+    if (config != id.config) { error = "session delta: saved with another engine configuration"; return false; }
+    if (payload > size || size - kHeader - kTrailer != payload) {
+        error = "session delta: size " + std::to_string(size) + " does not match the header";
+        return false;
+    }
+    if (limits.admit) {
+        std::string why;
+        if (!limits.admit(session_read_peak_bytes(size), why)) {
+            st.error = SessionError::memory;
+            error = "session delta: " + why;
+            return false;
+        }
+    }
+    SessionDelta parsed;
+    In in{&f, SessionHasher(0), payload, error, limits};
+    if (!get_delta_payload(in, parsed)) { st.error = in.kind; return false; }
+    if (in.left) { error = "session delta: payload has " + std::to_string(in.left) + " unparsed bytes"; return false; }
+    uint8_t t[kTrailer];
+    if (!f.read(t, kTrailer)) { st.error = f.kind(); error = "session delta: trailer read error: " + f.error(); return false; }
+    uint64_t ph = 0;
+    std::memcpy(&ph, t, 8);
+    if (ph != in.hash.digest()) { error = "session delta: payload checksum mismatch"; return false; }
+    if (std::memcmp(t + 8, kDeltaEnd, 8) != 0) { error = "session delta: bad end marker"; return false; }
+    delta = std::move(parsed);
+    bytes = (size_t) size;
+    st.error = SessionError::none;
+    return true;
+}
+}  // namespace
+
+uint64_t session_base_fingerprint(const std::vector<int32_t>& live_ids, const std::vector<int64_t>& cells,
+                                  const std::vector<int64_t>& pooled_rows) {
+    std::vector<uint8_t> bytes;
+    auto put = [&](const void* p, size_t n) {
+        const uint8_t* b = static_cast<const uint8_t*>(p);
+        bytes.insert(bytes.end(), b, b + n);
+    };
+    const uint64_t n = live_ids.size();
+    put(&n, 8);
+    if (n) put(live_ids.data(), n * sizeof(int32_t));
+    const uint64_t layers = cells.size();
+    put(&layers, 8);
+    if (layers) put(cells.data(), layers * sizeof(int64_t));
+    if (layers) put(pooled_rows.data(), std::min<size_t>(pooled_rows.size(), layers) * sizeof(int64_t));
+    return session_hash64(bytes.data(), bytes.size(), 0x5354525344ull);
+}
+
+SessionKvSource session_delta_tail_source(const SessionKvSource& full, int64_t base_cells, int64_t base_pooled) {
+    SessionKvSource tail = full;
+    std::array<size_t, 5> shift{};
+    for (size_t part = 0; part < 5; ++part) {
+        const int64_t units = part == 4 ? full.pooled_rows : full.cells;
+        const int64_t base = std::min(part == 4 ? base_pooled : base_cells, units);
+        if (units > 0 && base > 0) {
+            const size_t per = full.sizes[part] / static_cast<size_t>(units);
+            shift[part] = std::min(full.sizes[part], per * static_cast<size_t>(base));
+        }
+        tail.sizes[part] = full.sizes[part] - shift[part];
+    }
+    const auto inner = full.read;
+    tail.read = [inner, shift](size_t part, size_t offset, void* dst, size_t n) {
+        return inner(part, offset + shift[part], dst, n);
+    };
+    return tail;
+}
+
+bool session_delta_write(const std::string& path, const SavedConversation& meta,
+                         const std::vector<SessionKvSource>& tails, const std::vector<int64_t>& base_cells,
+                         const std::vector<int64_t>& base_pooled, uint64_t base_fingerprint,
+                         const SessionFileIdentity& id, size_t& bytes, std::string& error,
+                         const SessionWriteOptions& opt, SessionStatus* status) {
+    SessionStatus st;
+    bool ok = false;
+    try {
+        ok = write_delta_impl(path, meta, tails, base_cells, base_pooled, base_fingerprint, id, bytes, error, opt, st);
+    } catch (const std::bad_alloc&) {
+        error = "session delta: out of memory while writing " + path;
+        st.error = SessionError::memory;
+        ok = false;
+    }
+    if (status) *status = st;
+    return ok;
+}
+
+bool session_delta_read(const std::string& path, const SessionFileIdentity& id, SessionDelta& delta, size_t& bytes,
+                        std::string& error, const SessionReadLimits& limits, SessionStatus* status) {
+    SessionStatus st;
+    bool ok = false;
+    try {
+        ok = read_delta_impl(path, id, delta, bytes, error, limits, st);
+    } catch (const std::bad_alloc&) {
+        error = "session delta: out of memory while reading " + path;
+        st.error = SessionError::memory;
+        ok = false;
+    }
+    if (status) *status = st;
+    return ok;
+}
+
+bool session_delta_apply(SavedConversation& base, const SessionDelta& delta, std::string& error) {
+    std::vector<int64_t> cells, pooled;
+    for (const auto& k : base.kv) {
+        cells.push_back(k.cells);
+        pooled.push_back(k.pooled_rows);
+    }
+    if (base.kv.size() != delta.tails.size() || delta.base_cells.size() != delta.tails.size()) {
+        error = "session delta: the base has another number of K/V layers";
+        return false;
+    }
+    if (session_base_fingerprint(base.live.ids, cells, pooled) != delta.base_fingerprint) {
+        error = "session delta: the base image is not the one the delta was cut from";
+        return false;
+    }
+    if (base.geometry != delta.meta.geometry || base.layer_lo != delta.meta.layer_lo ||
+        base.layer_hi != delta.meta.layer_hi) {
+        error = "session delta: the base has another geometry or layer carve";
+        return false;
+    }
+    // Every layer is checked before the first one changes, so a refusal leaves the base as it was.
+    for (size_t i = 0; i < base.kv.size(); ++i) {
+        const KvDelta& t = delta.tails[i];
+        if (base.kv[i].cells != t.base_cells || base.kv[i].pooled_rows != t.base_pooled ||
+            t.tail.cells < t.base_cells || t.tail.pooled_rows < t.base_pooled) {
+            error = "session delta: a K/V layer's extent does not match the base";
+            return false;
+        }
+    }
+    for (size_t i = 0; i < base.kv.size(); ++i) {
+        if (!kv_delta_apply(base.kv[i], delta.tails[i], error)) return false;
+    }
+    base.live = delta.meta.live;
+    base.checkpoints = delta.meta.checkpoints;
+    base.cvec = delta.meta.cvec;
+    return true;
 }
 
 } // namespace strata::core

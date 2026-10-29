@@ -286,6 +286,8 @@ ENGINE_SILENCE_S = 300.0
 # Disk sessions: the longest allowance an engine may announce (`SWAIT <phase> <s>`) for one step that blocks in a
 # single call (a file flush, the host->device transfer); the engine's own bound is the same (session_phase_limit_s).
 SESSION_WAIT_MAX_S = 3600
+# the engine's session answers: they go to the session queue, not to the generation lines (see _pump)
+SESSION_REPLIES = ("SAVING ", "SAVED ", "SERR ", "RESTORED ", "SESSION ", "SWAIT ")
 # ... except while a prompt is read: a PP line comes once per chunk (up to 32768 tokens with --prefill auto, issue
 # #282), and the slowest PCs read ~100 tok/s, so a first chunk can take minutes before the first line.  Until the first
 # PP the wait adds the chunk's tokens at PP_FLOOR_TOK_S; after one, a chunk may take PP_SLACK x the last one's time.
@@ -362,7 +364,7 @@ class MockEngine:
         self.cycle = bool(cycle)
         self.last_prompt: list[int] = []
 
-    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None, keep_slot=False, turn_hook=None):
         self.last_prompt = list(ids)
         self.last_embeddings = embeddings
         if len(self.scripts) > 1:
@@ -423,7 +425,7 @@ class SessionRefused(ValueError):
     <reason>`).  `kind` is the engine's category - invalid (400), storage (507), memory (503), io (500); `published`:
     a save whose new file already replaced the old one before a later step (the folder flush) failed."""
 
-    STATUS = {"invalid": 400, "storage": 507, "memory": 503, "io": 500}
+    STATUS = {"invalid": 400, "storage": 507, "memory": 503, "io": 500, "busy": 409}
 
     def __init__(self, kind: str, message: str, published: bool = False):
         super().__init__(message)
@@ -1138,6 +1140,10 @@ class StrataEngine:
         self.ended = False                              # READY: alive from here (restart() set it True, #344)
         # the engine's stdout on a thread, so a request can wait with a timeout (heartbeats, cancel checks)
         self.lines: queue.Queue = queue.Queue()
+        # the session replies (SAVING, SAVED, SERR, RESTORED, SESSION, SWAIT): their own queue, so a request reading the
+        # generation lines never meets a save that is still being written (see _pump, await_session_file)
+        self.save_q: queue.Queue = queue.Queue()
+        self.save_pending: dict | None = None           # the SAVE answered SAVING, its SAVED not read yet
         # --batch: concurrent requests in the engine's batch slots (see generate_batched).  The engine says how many
         # it runs (INFO batch_slots=N: it may have fewer than asked, or none, when they do not fit)
         asked = next((int(args[args.index(k) + 1]) for k in ("--batch", "--slots") if k in args), 0)
@@ -1192,10 +1198,13 @@ class StrataEngine:
         self.pump.start()
 
     def _pump(self):
-        proc, lines = self.proc, self.lines             # this process's: a restart replaces both (#344)
+        proc, lines, save_q = self.proc, self.lines, self.save_q   # this process's: a restart replaces them (#344)
         slot_q = self.slot_q
         line = None
         for line in proc.stdout:
+            if line.startswith(SESSION_REPLIES):        # a session's answers: read by its own waiter, never a request
+                save_q.put(line)
+                continue
             # checked before batch routing: a fatal line is never a slot's own
             if line.startswith(FATAL_PREFIXES):
                 # release_gpu_waits invalidates the verifier, even if the native
@@ -1230,6 +1239,7 @@ class StrataEngine:
             if line and line.startswith("ERR"):         # #997 #890: why it exited, though no request may read it
                 self.last_err = line[4:].strip()        # (a failed batch window: every request reads its slot)
         lines.put(None)
+        save_q.put(None)
         for q in slot_q:
             q.put(None)
 
@@ -1626,6 +1636,33 @@ class StrataEngine:
                 return line
         return None
 
+    def _await_bdone(self, slot: int, tail: list[int]):
+        """Reads a slot's lines until its BDONE (its turn is over in the engine): (finish, the tokens the slot fed, with
+        the BT lines still to come) or None when it does not come."""
+        q = self.slot_q[slot]
+        tail = list(tail)
+        end = time.monotonic() + 60.0
+        while time.monotonic() < end:
+            try:
+                line = q.get(timeout=5.0)
+            except queue.Empty:
+                continue
+            if line is None:
+                return None
+            if line.startswith("BT "):
+                try:
+                    tail.append(int(line.split()[2]))
+                except (IndexError, ValueError):
+                    return None
+            if line.startswith("BDONE "):
+                f = line.split()
+                # the slot leg's decode time and tokens are this request's: a turn stopped before its end (a reasoning
+                # budget's wrap-up, a stop string) kept the admission's single token otherwise, and the request's
+                # totals lost the whole leg
+                self._apply_bdone(f)
+                return (f[3] if len(f) > 3 else "", tail)
+        return None
+
     def _release_slot_when_done(self, slot: int, stream: list[int] | None = None):
         """A slot whose consumer left (a stop token, a stop string, a disconnect): BSTOP it and free it once the engine
         says BDONE (in the background).  `stream`: the prompt and every token of it so far - with the tokens still to
@@ -1802,7 +1839,7 @@ class StrataEngine:
         with self.slot_cv:
             return any(e[0] * 2 <= plen for e in self.wait_lens)
 
-    def generate_batched(self, ids, max_new, sampling, cancel, embeddings=None):
+    def generate_batched(self, ids, max_new, sampling, cancel, embeddings=None, keep_slot=False, turn_hook=None):
         """--batch.  Alone (no slot busy, nobody waiting): the solo path (GEN, with drafts: the fastest stream)
         - and when another request arrives meanwhile, this one is STOPped and continues in a batch slot (BGEN with
         its prompt + what it generated: the engine reuses that prefix).  Otherwise: BGEN into a free slot, then the
@@ -1845,7 +1882,7 @@ class StrataEngine:
                         return
                     holding, born = True, self.gen                  # (the engine it now has the control lines of)
                 with self.slot_cv:
-                    alone = not any(self.slot_busy) and self.waiting == 0
+                    alone = not keep_slot and not any(self.slot_busy) and self.waiting == 0
                 if alone and left > 1:
                     head = f"GENI {left}{keys} {embeddings}" if embeddings else f"GEN {left}{keys}"
                     self._last_done = None                  # (#879: this request's DONE decides below)
@@ -2074,8 +2111,8 @@ class StrataEngine:
                                 stop_sent = True
                             continue
                         yield t
-                        if not going_solo and not stop_sent and self._may_go_solo(int(max_new) - len(out), solo_again,
-                                                                                  embeddings):
+                        if not going_solo and not stop_sent and not keep_slot and self._may_go_solo(
+                                int(max_new) - len(out), solo_again, embeddings):
                             self._send(f"BSTOP {slot}")         # alone now: on with the drafts (below)
                             going_solo = True
                     elif line.startswith("BDONE "):
@@ -2087,6 +2124,13 @@ class StrataEngine:
                         if f[3:4] == ["nonfinite"]:              # #879: the engine dropped the slot's state
                             self.slot_held[slot] = []
                             raise EngineNonFinite("the engine's logits became non-finite (#879)")
+                        # a turn that finished (not one the solo path takes back) is handed to its owner while the slot
+                        # is still its own: the K/V and the tokens are there, nothing else is admitted into the slot
+                        if turn_hook is not None and f[3:4] != ["cancel"]:
+                            try:
+                                turn_hook(slot, list(self.slot_held[slot]))
+                            except Exception as error:      # the turn's own answer is not lost to its save
+                                print(f"strata serve: turn hook failed: {error}", file=sys.stderr, flush=True)
                         if (going_solo and f[3:4] == ["cancel"] and not cancel.is_set() and len(out) < int(max_new)
                                 and not (out and out[-1] in EOS_IDS)):
                             # the solo path continues it: the engine copies the slot's sessions back (all but the
@@ -2123,12 +2167,13 @@ class StrataEngine:
                         phase = "slot"
             except EngineDied:
                 pass
-            bdone_in = False
+            bdone_in, bd_finish = False, ""
             if phase == "slot" and slot is not None and out and out[-1] in EOS_IDS and self.gen == born:
                 bd = self._bdone_after_eos(slot)            # (#1869) the slot's figures, not the admission's
                 if bd is not None:
                     self._apply_bdone(bd.split())
                     bdone_in = True
+                    bd_finish = bd.split()[3] if len(bd.split()) > 3 else ""
             if reused0 is not None and isinstance(self.last, dict):
                 self.last = {**self.last, "reused": reused0}
             if carry and isinstance(self.last, dict):
@@ -2147,22 +2192,57 @@ class StrataEngine:
                 self.slot_live[slot] = None
                 self.slot_used[slot] = time.time()
                 if phase == "slot" and bdone_in:
+                    # the turn ended on its EOS and its BDONE came with it (read above): handed to its owner while the
+                    # slot still holds it, as the BDONE wait below does
                     stream = list(prompt) + out[gen0:] if gen0 is not None and len(out) > gen0 else None
                     self.slot_held[slot] = stream[:-1] if stream else []     # as the BDONE wait leaves it
+                    if turn_hook is not None and bd_finish in ("stop", "length"):
+                        try:
+                            turn_hook(slot, list(self.slot_held[slot]))
+                        except Exception as error:
+                            print(f"strata serve: turn hook failed: {error}", file=sys.stderr, flush=True)
                     with self.slot_cv:
                         self.slot_busy[slot] = False
                         self.slot_claims.discard(slot)
                         self.slot_cv.notify_all()
-                elif phase == "slot":
-                    self.slot_held[slot] = []
-                    stream = list(prompt) + out[gen0:] if gen0 is not None and len(out) > gen0 else None
-                    self._release_slot_when_done(slot, stream)    # freed at its BDONE
-                    self.slot_claims.discard(slot)                # (the BDONE wait owns it now)
                 else:
-                    with self.slot_cv:
-                        self.slot_busy[slot] = False
-                        self.slot_claims.discard(slot)
-                        self.slot_cv.notify_all()
+                    # a turn that ended on its own token (the consumer stopped at the EOS, or the length) is handed to its
+                    # owner in the same way as at BDONE: the engine's BDONE comes at once, the slot holds the turn until then
+                    # the engine says how the turn ended (BDONE's finish): stop or length hands the turn to its owner.
+                    # A consumer that left before the turn's end (a reasoning budget's wrap-up, a stop string) BSTOPs
+                    # the slot first: otherwise it decodes on until the wait below gives up (60 s of lost tokens)
+                    if (phase == "slot" and turn_hook is not None and gen0 is not None and not cancel.is_set()
+                            and not stop_sent and not (out and out[-1] in EOS_IDS) and len(out) < int(max_new)):
+                        try:
+                            self._send(f"BSTOP {slot}")
+                            stop_sent = True
+                        except EngineDied:
+                            pass
+                    ended = (self._await_bdone(slot, list(prompt) + out[gen0:])
+                             if phase == "slot" and turn_hook is not None and gen0 is not None and not cancel.is_set()
+                             else None)
+                    if ended is not None:
+                        fin, tokens = ended
+                        self.slot_held[slot] = list(tokens[:-1]) if tokens else []
+                        if fin in ("stop", "length"):
+                            try:
+                                turn_hook(slot, list(self.slot_held[slot]))
+                            except Exception as error:
+                                print(f"strata serve: turn hook failed: {error}", file=sys.stderr, flush=True)
+                        with self.slot_cv:
+                            self.slot_busy[slot] = False
+                            self.slot_claims.discard(slot)
+                            self.slot_cv.notify_all()
+                    elif phase == "slot":
+                        self.slot_held[slot] = []
+                        stream = list(prompt) + out[gen0:] if gen0 is not None and len(out) > gen0 else None
+                        self._release_slot_when_done(slot, stream)    # freed at its BDONE
+                        self.slot_claims.discard(slot)                # (the BDONE wait owns it now)
+                    else:
+                        with self.slot_cv:
+                            self.slot_busy[slot] = False
+                            self.slot_claims.discard(slot)
+                            self.slot_cv.notify_all()
 
     slot_groups = 1         # --batch-groups (set when the engine starts)
     SLOT_PREFIX_MIN = 512   # a held prefix shorter than this is not worth unbalancing the pipeline's groups
@@ -2228,7 +2308,7 @@ class StrataEngine:
                          "tok_s": round(r["generated"] / max(1e-6, now - ft), 1) if ft else None})
         return view
 
-    def generate(self, ids, max_new, sampling, cancel, embeddings=None, prefill_only=False):
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None, prefill_only=False, keep_slot=False, turn_hook=None):
         """Yields token ids, and None as a heartbeat every 10 s while the engine is quiet (reading a long prompt):
         the HTTP layer turns it into an SSE comment, which keeps clients' watchdogs calm and notices a client that
         has gone.  A consumer that stops early (or `cancel`) makes the engine STOP, so it does not run to max_new."""
@@ -2236,7 +2316,8 @@ class StrataEngine:
             raise EngineDied("the engine is unavailable; this request was not sent")
         bias_api.validate_request(sampling or {}, self, None)
         if getattr(self, "batch", 0):
-            yield from self.generate_batched(ids, max_new, sampling, cancel, embeddings)
+            yield from self.generate_batched(ids, max_new, sampling, cancel, embeddings, keep_slot=keep_slot,
+                                             turn_hook=turn_hook)
             return
         self.progress, self.progress_ms, self.reused = None, 0, 0
         self.prefill_tok_s_mean = None
@@ -2430,7 +2511,70 @@ class StrataEngine:
             pass
         return EngineSilent(f"{what}; the server ended the engine")
 
-    def session_file(self, action: str, path: str) -> dict:
+    def session_file(self, action: str, path: str, slot: int | None = None, ids: list[int] | None = None,
+                     in_turn: bool = False) -> dict:
+        """A disk session (see `_session_round`).  `slot`: one batch slot's session, `SAVE @<slot>` / `RESTORE @<slot>`.
+        It needs every slot idle (the engine runs nothing else meanwhile), and the slot is busy while it moves.  A save
+        returns the tokens the slot holds (`ids`); a restore sets them, as the slot's held tokens for the next turn
+        (`ids` is required).  A failed restore leaves the slot holding nothing: its state is no longer known."""
+        self._settle_pending()                          # an earlier save's SAVED is read first: it is in the same queue
+        if slot is None:
+            return self._session_round(action, path, None)
+        if not getattr(self, "batch", 0) or not 0 <= int(slot) < self.batch:
+            raise ValueError(f"no batch slot {slot}")
+        if action.startswith("restore") and ids is None:
+            raise ValueError("a slot restore needs the tokens the session holds")
+        # in_turn: the slot is the caller's own turn (its window is still open); the others must be idle
+        with self.slot_cv:
+            if any(b for x, b in enumerate(self.slot_busy) if x != slot) or (not in_turn and self.slot_busy[slot]):
+                raise SessionRefused("busy", "a batch slot is busy: the session waits until every slot is idle")
+            was_busy = self.slot_busy[slot]
+            self.slot_busy[slot] = True
+        try:
+            try:
+                result = self._session_round(action, path, slot)
+                if result.get("pending"):               # SAVING: the caller awaits the file with await_session_file
+                    ticket = {"path": path, "slot": slot, "result": None, "error": None, "done": False}
+                    self.save_pending = result["pending"] = ticket
+            except Exception:
+                if action.startswith("restore"):
+                    self.slot_held[slot] = []
+                raise
+            if action.startswith("restore"):
+                self.slot_held[slot] = list(ids)
+            else:
+                # the image holds the first `tokens` of the slot's tokens: the turn boundary, when the engine saved one
+                result["ids"] = list(self.slot_held[slot][:int(result.get("tokens") or 0)])
+            self.slot_used[slot] = time.time()
+            return result
+        finally:
+            with self.slot_cv:
+                self.slot_busy[slot] = was_busy
+                self.slot_cv.notify_all()
+
+    def _settle_pending(self) -> None:
+        """Reads the SAVED (or SERR) of an earlier save answered SAVING, before anything else goes to the engine. Its
+        error stays on its ticket: the caller that asked for that save gets it."""
+        ticket = self.save_pending
+        if ticket is not None:
+            self.await_session_file(ticket, raise_error=False)
+
+    def await_session_file(self, ticket: dict, raise_error: bool = True) -> dict:
+        """The file of a save answered SAVING: waits for its SAVED (or SERR). While it waits the engine runs requests;
+        the state the save copied is already in RAM. -> the SAVED numbers; SessionRefused / EngineDied on failure."""
+        if not ticket["done"]:
+            try:
+                ticket["result"] = self._session_round("save", ticket["path"], ticket["slot"], await_only=True)
+            except Exception as e:                      # kept on the ticket: its caller reads it, not the next request
+                ticket["error"] = e
+            ticket["done"] = True
+            if self.save_pending is ticket:
+                self.save_pending = None
+        if ticket["error"] is not None and raise_error:
+            raise ticket["error"]
+        return ticket["result"]
+
+    def _session_round(self, action: str, path: str, slot: int | None, await_only: bool = False) -> dict:
         """Disk sessions: `SAVE <path>` / `RESTORE <path>` between requests (the caller holds the service FIFO).
         -> {"tokens", "bytes", "ms"}.  SessionRefused (kind, published) when the engine refused or failed the file and
         is still in step (`SERR <kind> <0|1> <reason>`).  Any line this exchange does not allow - an unknown or
@@ -2442,16 +2586,23 @@ class StrataEngine:
         a step that blocks in one call (a flush, the device transfer): until the next line the wait is that step's
         explicit allowance (at most SESSION_WAIT_MAX_S) when it is longer than engine_silence_s - no more, so a step
         that never ends is still ended."""
-        if action not in ("save", "restore") or any(c in path for c in "\r\n\0"):
+        if action not in ("save", "restore", "save_delta", "restore_delta") or any(c in path for c in "\r\n\0"):
             raise ValueError("invalid session command")
-        try:
-            self.proc.stdin.write(f"{'SAVE' if action == 'save' else 'RESTORE'} {path}\n")
-            self.proc.stdin.flush()
-        except OSError:
-            raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
+        # the engine's command word, and the answer it prints: a delta is answered like a whole session
+        word = {"save": "SAVE", "restore": "RESTORE", "save_delta": "SAVE_DELTA", "restore_delta": "RESTORE_DELTA"}[action]
+        save = action in ("save", "save_delta")
+        if not await_only:                              # await_only: the command went out before (await_session_file)
+            try:
+                target = f"{word} @{slot} {path}" if slot is not None else f"{word} {path}"
+                self.proc.stdin.write(target + "\n")
+                self.proc.stdin.flush()
+            except OSError:
+                raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
         silence = float(self.silence_s or 0)
         heard = time.monotonic()
-        want = "SAVED" if action == "save" else "RESTORED"
+        want = "SAVED" if save else "RESTORED"
+        # SAVING: a layer split's save answered once its state is in RAM, the file written on the engine's thread
+        pending_ok = save and not await_only
 
         def out_of_step(line: str) -> EngineDied:
             self.ended = True                               # not alive from now: the next request restarts it
@@ -2476,7 +2627,7 @@ class StrataEngine:
             try:
                 if left is not None and left <= 0:
                     raise queue.Empty
-                line = self.lines.get(timeout=left)
+                line = self.save_q.get(timeout=left)
             except queue.Empty:
                 raise self._silent(f"the engine said nothing for {limit:.0f} s during a session {action}"
                                    + (f" (in a blocking step allowed {allow:.0f} s)" if allow > silence else "")) from None
@@ -2514,6 +2665,16 @@ class StrataEngine:
                 if len(parts) != 4 or parts[1] not in SessionRefused.STATUS or parts[2] not in ("0", "1"):
                     raise out_of_step(line)
                 raise SessionRefused(parts[1], parts[3].strip(), parts[2] == "1")
+            if pending_ok and head == "SAVING":
+                try:
+                    if len(f) != 3:
+                        raise ValueError
+                    tokens, ms = count(f[1]), float(f[2])
+                    if not math.isfinite(ms) or ms < 0:
+                        raise ValueError
+                except ValueError:
+                    raise out_of_step(line) from None
+                return {"tokens": tokens, "bytes": None, "ms": ms, "pending": True}
             if head == want:
                 try:
                     if len(f) != 4:
@@ -5227,21 +5388,24 @@ class Service:
         return now
 
     def run(self, ids, thinking, tools, max_new, sampling, cancel, force=None,
-            declared_only=False) -> Iterator[tuple[str, object]]:
+            declared_only=False, keep_slot=False, turn_hook=None) -> Iterator[tuple[str, object]]:
         """The request's events (see _run); with "prevent_sleep" in the config, the PC stays awake while it runs or waits."""
         ka = self.keep_awake
         if ka is not None:
             ka.acquire()
         try:
-            yield from self._run(ids, thinking, tools, max_new, sampling, cancel, force, declared_only)
+            yield from self._run(ids, thinking, tools, max_new, sampling, cancel, force, declared_only, keep_slot=keep_slot,
+                                 turn_hook=turn_hook)
         finally:
             if ka is not None:
                 ka.release()
 
     def _run(self, ids, thinking, tools, max_new, sampling, cancel, force=None,
-             declared_only=False) -> Iterator[tuple[str, object]]:
+             declared_only=False, keep_slot=False, turn_hook=None) -> Iterator[tuple[str, object]]:
         """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..}).
-        `force` (forced_call): the opening of the call the reply must make - see prepare()."""
+        `force` (forced_call): the opening of the call the reply must make - see prepare().
+        `keep_slot` (--batch): the turn stays in a batch slot, where a session can save it (no solo path).
+        `turn_hook(slot, held)`: called in the turn's slot window at its end, while the slot still holds the turn."""
         # the model card's sampling for this thinking state, then the config's block, then the Chat settings shared with
         # apps; the request's own fields win over all of them
         defaults = {**model_card_sampling(self.model_arch, thinking), **self.sampling_defaults, **self.shared}
@@ -5422,8 +5586,9 @@ class Service:
                     while True:
                         segment_before = getattr(self.engine, "last", None)
                         segments_before = len(segments)     # (#879: a pass sent again leaves no segment)
-                        gen = self.engine.generate(prompt, max_new - n, sampling, cancel, embeddings=emb) if emb \
-                            else self.engine.generate(prompt, max_new - n, sampling, cancel)
+                        slot_kw = {"keep_slot": True, "turn_hook": turn_hook} if keep_slot else {}
+                        gen = self.engine.generate(prompt, max_new - n, sampling, cancel, embeddings=emb, **slot_kw) if emb \
+                            else self.engine.generate(prompt, max_new - n, sampling, cancel, **slot_kw)
                         recover_prompt = None
                         seg, wrap, leaving = [], False, False   # this pass's tokens; the budget is reached; closed
                         nonfinite = False               # #879: the engine ended this pass on non-finite logits
