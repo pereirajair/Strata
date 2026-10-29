@@ -695,6 +695,50 @@ def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
     return ToolCall(name=name, arguments=args)
 
 
+NEAR_WRAPPER = "<parameter_calls>"
+NEAR_TAG = re.compile(r'<parameter\s+name\s*=\s*"([^"<>]+)"\s*>')
+# A whole call in the near form: the wrapper, an invoke naming the tool, and the closing `</function>` followed by the
+# wrapper's end (`</tool_call>` or `</parameter_calls>`).
+NEAR_BLOCK = re.compile(r'<parameter_calls>\s*<parameter\s+name\s*=\s*"([^"<>]+)"\s*>.*?</function>\s*'
+                        r'(?:</tool_call>|</parameter_calls>)', re.S)
+
+
+def canonical_near_form(text: str, schemas: dict) -> str:
+    """recover: a call in the near form some models emit (`<parameter_calls>` as the wrapper, `<parameter name="N">`
+    for the invoke and for each parameter) is rewritten to the template's form (`<tool_call>`, `<function=N>`,
+    `<parameter=N>`), only when its invoke names a declared tool; any other text stays as it is. Only whole blocks are
+    rewritten, so the result is the same whether the text arrives whole or in pieces."""
+
+    def block(match: re.Match) -> str:
+        if match.group(1) not in schemas:
+            return match.group(0)
+        s = match.group(0).replace(NEAR_WRAPPER, CALL_START, 1)
+        s = re.sub(r"</parameter_calls>$", CALL_END, s)
+        invoke = [True]
+
+        def tag(t: re.Match) -> str:
+            if invoke[0]:
+                invoke[0] = False
+                return f"{FUNC_START}{t.group(1)}>"
+            return f"{PARAM_START}{t.group(1)}>"
+
+        return NEAR_TAG.sub(tag, s)
+
+    return NEAR_BLOCK.sub(block, text)
+
+
+def near_call_hold(text: str) -> int:
+    """recover: where text that may still become a near-form call starts (the wrapper, or a partial wrapper at the
+    end of the text), -1 for none. A wrapper that is already a whole block is not held."""
+    at = text.find(NEAR_WRAPPER)
+    if at >= 0:
+        return -1 if NEAR_BLOCK.match(text, at) else at
+    for k in range(max(0, len(text) - len(NEAR_WRAPPER) + 1), len(text)):
+        if text[k] == "<" and NEAR_WRAPPER.startswith(text[k:]):
+            return k
+    return -1
+
+
 RCALL_MAX = 32768        # the most of a `<tool_call>` inside the reasoning that is held while waiting for its end (#804)
 
 
@@ -934,6 +978,19 @@ class OutputParser:
 
     def feed(self, delta: str) -> list[Event]:
         self.buf += delta
+        if not (self.recover and self.schemas):
+            return self._run()
+        self.buf = canonical_near_form(self.buf, self.schemas)
+        # A near-form call still arriving is held back, not streamed as text: it becomes a call once it is whole.
+        at = near_call_hold(self.buf)
+        if at >= 0:
+            held, self.buf = self.buf[at:], self.buf[:at]
+            out = self._run()
+            self.buf += held
+            return out
+        return self._run()
+
+    def _run(self) -> list[Event]:
         out: list[Event] = []
         while True:
             if self.state == "rcall":
