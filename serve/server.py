@@ -971,6 +971,8 @@ class StrataEngine:
     gpu_busy = None                      # #1317: () -> bool, "the GPU is working" (the telemetry's reading); a GPU at work is not frozen
     last_err = None                      # #997: an ERR that was its last stdout line (death_note says it)
     batch = 0                            # --batch: the engine's batch slots (0: one request at a time)
+    save_q = None                        # the session replies' queue, set at READY (none yet: they arrive on `lines`)
+    save_pending = None                  # the SAVE answered SAVING, its SAVED not read yet
 
     # `last`: the figures of the engine's last DONE line.  With batch slots several requests run at once, each on its
     # own thread, so each one reads its own request's figures (Service.run records them); one at a time, the one dict.
@@ -2627,7 +2629,7 @@ class StrataEngine:
             try:
                 if left is not None and left <= 0:
                     raise queue.Empty
-                line = self.save_q.get(timeout=left)
+                line = (self.save_q if self.save_q is not None else self.lines).get(timeout=left)
             except queue.Empty:
                 raise self._silent(f"the engine said nothing for {limit:.0f} s during a session {action}"
                                    + (f" (in a blocking step allowed {allow:.0f} s)" if allow > silence else "")) from None
