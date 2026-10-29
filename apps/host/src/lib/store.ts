@@ -307,7 +307,8 @@ function set(patch: Partial<AppState> | ((s: AppState) => Partial<AppState>)) {
   state = { ...state, ...next };
   // Opening another chat shows that chat's model choice and whether that chat is mid-turn.
   if (state.activeSession !== before) {
-    const chosen = state.sessions.find(s => s.id === state.activeSession)?.preferences?.remoteModel ?? null;
+    const saved = state.sessions.find(s => s.id === state.activeSession)?.preferences?.remoteModel;
+    const chosen = saved === undefined ? fallbackRemote(state) : saved;
     state = { ...state, remoteModel: 'remoteModel' in next ? state.remoteModel : chosen, streaming: !!state.activeSession && liveTurns.has(state.activeSession) };
   }
   for (const l of listeners) l();
@@ -342,10 +343,23 @@ export function selectRemoteModel(remoteModel: RemoteModelSelection | null) {
   if (id) patchSession(id, s => ({ ...s, preferences: { ...s.preferences, remoteModel } }));
   try { localStorage.removeItem('strata.remote-model.v1'); } catch { /* The old global choice is retired. */ }
 }
+/** With no local model loaded, a chat that never chose a model answers from the first API model listed (an app whose
+ *  models are all behind an API, such as one whose engine runs on another machine), instead of refusing with "No model
+ *  is loaded". A chat that chose the local model (null) keeps that choice. */
+function fallbackRemote(s: AppState): RemoteModelSelection | null {
+  if (nativeState()?.instances.some(i => i.status === 'ready')) return null;
+  for (const c of s.providers?.connections ?? []) if (c.models.length) return { connectionId: c.id, modelId: c.models[0].id };
+  return null;
+}
 function applyProviders(providers: ModelProviders) {
   // A chat whose API model was removed keeps its choice: the next send says the model is gone, rather
   // than quietly answering from the local model.
   set({ providers });
+  const saved = state.sessions.find(s => s.id === state.activeSession)?.preferences?.remoteModel;
+  if (state.remoteModel === null && saved === undefined) {
+    const fallback = fallbackRemote(state);
+    if (fallback) set({ remoteModel: fallback });
+  }
 }
 export async function saveModelConnection(draft: ModelConnectionDraft) {
   applyProviders(await api.post<ModelProviders>('/api/model-providers', draft));
