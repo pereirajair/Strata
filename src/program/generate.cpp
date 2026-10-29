@@ -10168,7 +10168,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata serve: layer split: layers %s, one hand-off per window%s\n", plan_s.c_str(),
                          overlap ? " (overlapped: STRATA_SPLIT_OVERLAP=1)" : "");
             // the layer ranges alone (no GPU names): a session file is only usable on a machine with the same split
-            g_layer_ranges = "0-" + std::to_string(split_at[0] - 1);
+            g_layer_ranges = std::to_string(split_lo) + "-" + std::to_string(split_at[0] - 1);
             for (int st = 1; st < n_stages; ++st)
                 g_layer_ranges += "|" + std::to_string(split_at[(size_t) st - 1]) + "-" +
                                   std::to_string(split_drive.end[st] - 1);
