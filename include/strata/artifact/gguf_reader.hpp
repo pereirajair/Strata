@@ -29,6 +29,7 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <cstdlib>
 #include <set>
 #include <stdexcept>
 #include <algorithm>
@@ -429,7 +430,37 @@ public:
     }
     const uint8_t* tensor_data(const TensorInfo& t) const { return base_ + data_start_ + t.offset; }
 
+    /// A layer slice cut by POM (its `pom.start_layer` / `pom.end_layer` / `pom.original_block_count` keys): the
+    /// tensors are read under their layers' numbers in the whole model (`blk.i` of the file is `blk.(start + i)`),
+    /// and `<arch>.block_count` reads as the whole model's, so the rest of the engine sees layers start..end of
+    /// the model.  `slice_begin() == -1`: not a slice.
+    int64_t slice_begin() const { return slice_begin_; }
+    int64_t slice_end() const { return slice_end_; }   ///< the last layer the slice holds, inclusive
+
 private:
+    int64_t slice_begin_ = -1, slice_end_ = -1;
+    /// POM slices: see slice_begin().  Runs after the directory is read, before the duplicate check.
+    void renumber_slice() {
+        const MetaValue* b = get("pom.start_layer");
+        const MetaValue* e = get("pom.end_layer");
+        const MetaValue* n = get("pom.original_block_count");
+        if (!b || !e || !n || e->u < b->u || n->u <= e->u) return;
+        slice_begin_ = (int64_t) b->u;
+        slice_end_ = (int64_t) e->u;
+        for (auto& t : tensors_) {
+            if (t.name.rfind("blk.", 0) != 0) continue;
+            const size_t dot = t.name.find('.', 4);
+            if (dot == std::string::npos) continue;
+            char* end = nullptr;
+            const unsigned long long i = std::strtoull(t.name.c_str() + 4, &end, 10);
+            if (end != t.name.c_str() + dot) continue;
+            t.name = "blk." + std::to_string(i + b->u) + t.name.substr(dot);
+        }
+        if (const MetaValue* arch = get("general.architecture")) {
+            auto it = meta_.find(arch->s + ".block_count");
+            if (it != meta_.end()) it->second.u = n->u;
+        }
+    }
     void open() {
 #ifdef _WIN32
         HANDLE h = CreateFileA(path_.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
@@ -507,6 +538,7 @@ private:
             t.offset = c.read<uint64_t>();
             tensors_.push_back(std::move(t));
         }
+        renumber_slice();
         uint64_t align = 32;
         if (const MetaValue* a = get("general.alignment"))
             if (a->u) align = a->u;
@@ -764,16 +796,29 @@ inline std::string read_geometry(const GgufFile& f, core::ModelGeometry& g) {
         return p + "rope.dimension_count = " + std::to_string(g.n_rot) + " is not an even slice of the head widths";
 
     // The layer split, twice over: the interval, and a ratio per layer that is non-zero (the indexer's pooling
-    // block) exactly on the full-attention layers.
+    // block) exactly on the full-attention layers.  A POM layer slice carries only its local part of every per-layer
+    // metadata array, while GgufFile exposes block_count as the whole model's (and renumbers its tensors to their
+    // absolute layers).  Read that local array at the same absolute offset.  Also accept a whole-model array in a
+    // slice for compatibility with slices made before POM shortened per-layer metadata.
     if (const MetaValue* v = f.get(p + "attention.compress_ratios")) {
-        if (v->type != MetaType::ARRAY || v->count != (uint64_t) g.n_layers || v->items.size() != v->count)
+        const bool sliced = f.slice_begin() >= 0;
+        const int64_t local_layers = sliced ? f.slice_end() - f.slice_begin() + 1 : g.n_layers;
+        int64_t first_layer = 0;
+        const bool local_array = sliced && v->count == (uint64_t) local_layers;
+        const bool whole_array = v->count == (uint64_t) g.n_layers;
+        if (v->type != MetaType::ARRAY || (!local_array && !whole_array) || v->items.size() != v->count) {
+            if (sliced)
+                return p + "attention.compress_ratios must list either the " + std::to_string(local_layers) +
+                       " layers in this POM slice or all " + std::to_string(g.n_layers) + " layers";
             return p + "attention.compress_ratios must list one entry for each of the " + std::to_string(g.n_layers) +
                    " layers";
+        }
+        if (local_array) first_layer = f.slice_begin();
         // A list of zeros only is a converter's placeholder, not a layer split (#2396: orcarouter's
         // Qwen3.8-Flash-Next-Uncensored GGUFs carry 48 zeros; 0.1.43 never read the key): it is treated as absent
         // and the compiled pooling block is used.  A list with any non-zero entry is checked in full below.
         bool given = false;
-        for (int64_t l = 0; l < g.n_layers && !given; ++l) given = v->items[(size_t) l].u != 0;
+        for (size_t i = 0; i < v->items.size() && !given; ++i) given = v->items[i].u != 0;
         if (!given) {
             static bool said = false;   // the guard runs several times in one process: one line
             if (!said) {
@@ -785,10 +830,11 @@ inline std::string read_geometry(const GgufFile& f, core::ModelGeometry& g) {
             return {};
         }
         int64_t block = 0;
-        for (int64_t l = 0; l < g.n_layers; ++l) {
-            const int64_t r = (int64_t) v->items[(size_t) l].u;
+        for (size_t i = 0; i < v->items.size(); ++i) {
+            const int64_t l = first_layer + (int64_t) i;
+            const int64_t r = (int64_t) v->items[i].u;
             if ((r != 0) != core::is_qsa_layer(g, l) || r < 0 || (block && r && r != block))
-                return p + "attention.compress_ratios[" + std::to_string(l) + "] = " + std::to_string(r) +
+                return p + "attention.compress_ratios[" + std::to_string(i) + "] = " + std::to_string(r) +
                        ", but full_attention_interval = " + std::to_string(g.qsa_interval) + " makes layer " +
                        std::to_string(l) + (core::is_qsa_layer(g, l) ? " full attention" : " linear attention") +
                        (block && r ? " (and the other full-attention layers pool " + std::to_string(block) + ")" : "");
